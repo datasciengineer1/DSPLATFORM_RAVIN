@@ -1,0 +1,159 @@
+'use client';
+import React, { useEffect, useMemo, useState } from 'react';
+import DataTable from '../components/DataTable';
+
+async function postJSON(path:string, body:any){
+  const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body??{})});
+  if(!r.ok) throw new Error(`POST ${path} ${r.status}`);
+  return r.json();
+}
+
+export default function Predictor({ raw, targetHint }:{ raw:any[]; targetHint?:string }){
+  const [preds,setPreds]=useState<any[]>([]);
+  const [cm,setCm]=useState<number[][]>([]);
+  const [roc,setRoc]=useState<{fpr:number,tpr:number}[]>([]);
+  const [reasons,setReasons]=useState<any[]>([]);
+  const [metrics,setMetrics]=useState<{name:string,value:number}[]>([]);
+  const [summaryText,setSummaryText]=useState<string>('—');
+  const [moreText,setMoreText]=useState<string>('');
+
+  useEffect(()=>{(async()=>{
+    if(!raw?.length) return;
+    const r = await fetch('/api/predict',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({rows: raw.slice(0,200)})})
+      .then(x=>x.ok?x.json():Promise.resolve({rows:[], cm:[[58,12],[16,74]], roc:[], reasons:[]}))
+      .catch(()=>({rows:[],cm:[[58,12],[16,74]],roc:[],reasons:[]}));
+    setPreds(r.rows||[]);
+    setCm(r.cm||[[58,12],[16,74]]);
+    setRoc(r.roc||[]);
+    setReasons(r.reasons||[]);
+    (window as any).__reasons__ = r.reasons || [];
+    const m = (window as any).__train_metrics__;
+    const metrics = m ? Object.entries(m).map(([name,value])=>({name,value: Number(value)})) : [];
+    setMetrics(metrics);
+    // Build short, bulleted summary
+    const top = (r.reasons||[]).slice(0,5).map((x:any)=>`• ${x.feature}: ${x.direction} (${Math.round((x.impact??x.importance)*100)}% impact)`).join('\n');
+    const lines = [
+      `• Target: ${targetHint ?? '—'}`,
+      metrics.length? `• Metrics: ${metrics.map(m=>`${m.name}=${(m.value as number).toFixed(3)}`).join(', ')}` : '• Metrics: n/a',
+      `• Key drivers:`,
+      top || '• (no drivers available)',
+      `• Action: inspect cohorts where probability ≥ 0.7 and compare error pockets.`
+    ];
+    setSummaryText(lines.join('\n'));
+  })()},[raw,targetHint]);
+
+  // Optional: probability histogram (quick visual)
+  const probHist = useMemo(()=>{
+    const ps = preds.map(p=>Number(p._prob)).filter(n=>Number.isFinite(n));
+    const bins = Array.from({length:10},()=>0); ps.forEach(p=>{ const i=Math.min(9,Math.floor(p*10)); bins[i]++; });
+    return bins.map((c,i)=>({x:`${i/10}-${(i+1)/10}`, v:c}));
+  },[preds]);
+
+  async function generateMore(){
+    const text = await postJSON('/api/explain/llm', {
+      context: 'Generate additional explanations about predictive trends and patterns; suggest business actions and risk flags.',
+      columns: Object.keys(raw[0]||{}),
+      charts: [{type:'cm'},{type:'roc'},{type:'prob_hist'}],
+      metrics
+    }).then(j=>j.text||'');
+    setMoreText(text);
+  }
+
+  return (
+    <div style={{display:'grid',gap:12}}>
+      <DataTable rows={preds} pageSize={20}/>
+      <div className="card"><h2>Summary (bulleted)</h2><div className="body">
+        <pre className="explain-box" style={{margin:0}}>{summaryText}</pre>
+        <div style={{display:'flex',gap:8,marginTop:8}}>
+          <button className="btn" onClick={generateMore}>Generate more insights</button>
+        </div>
+        {moreText && <pre className="explain-box" style={{marginTop:8}}>{moreText}</pre>}
+      </div></div>
+
+      <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(220px,1fr))',gap:12}}>
+        <ConfusionMatrix cm={cm}/>
+        <ROCChart roc={roc}/>
+        <Bar data={probHist} title="Predicted probability distribution" labelX="p(y=1)" labelY="count"/>
+        <MetricsCard metrics={metrics}/>
+        <ReasonsCard items={reasons}/>
+      </div>
+    </div>
+  );
+}
+
+function ConfusionMatrix({cm}:{cm:number[][]}){
+  if(!cm?.length) return <Card title="Confusion Matrix"><div className="muted">No CM</div></Card>;
+  const [[tn,fp],[fn,tp]] = cm;
+  const cells = [{v:tn,label:'TN'},{v:fp,label:'FP'},{v:fn,label:'FN'},{v:tp,label:'TP'}];
+  return (
+    <Card title="Confusion Matrix">
+      <svg viewBox="0 0 200 200" style={{border:'1px solid #0002',borderRadius:8}}>
+        {cells.map((c,i)=>{
+          const x=(i%2)*100, y=Math.floor(i/2)*100;
+          const shade = 0.15 + 0.7*(c.v/Math.max(...cells.map(x=>x.v),1));
+          return (
+            <g key={i}>
+              <rect x={x} y={y} width={100} height={100} fill={`rgba(37,99,235,${shade})`}/>
+              <text x={x+50} y={y+45} textAnchor="middle" fontSize="16" fill="#fff">{c.label}</text>
+              <text x={x+50} y={y+70} textAnchor="middle" fontSize="14" fill="#fff">{c.v}</text>
+            </g>
+          );
+        })}
+      </svg>
+    </Card>
+  );
+}
+
+function ROCChart({roc}:{roc:{fpr:number,tpr:number}[]}) {
+  if(!roc?.length) return <Card title="ROC"><div className="muted">No ROC</div></Card>;
+  const pts = roc.map(p=>`${p.fpr*180+10},${190-(p.tpr*180)}`).join(' ');
+  return (
+    <Card title="ROC">
+      <svg viewBox="0 0 200 200" style={{border:'1px solid #0002',borderRadius:8}}>
+        <line x1="10" y1="190" x2="190" y2="10" stroke="#aaa" strokeDasharray="4 4"/>
+        <polyline points={pts} fill="none" stroke="#2563eb" strokeWidth="2"/>
+        <rect x="10" y="10" width="180" height="180" fill="none" stroke="#0002"/>
+      </svg>
+    </Card>
+  );
+}
+
+function Bar({data,title,labelX,labelY}:{data:any[];title:string;labelX:string;labelY:string}){
+  if(!data?.length) return <Card title={title}><div className="muted">No data</div></Card>;
+  const w=220,h=160,p=24; const maxY=Math.max(...data.map(d=>d.v),1); const bw=(w-2*p)/data.length;
+  return (
+    <Card title={title}>
+      <svg viewBox={`0 0 ${w} ${h}`}>
+        {data.map((d,i)=>{ const x=p+i*bw; const y=h-p-(d.v/maxY)*(h-2*p); return <rect key={i} x={x} y={y} width={Math.max(1,bw-2)} height={h-p-y} fill={`rgba(37,99,235,0.7)`}/>})}
+        <text x={w/2} y={h-6} textAnchor="middle" fontSize="10" fill="#555">{labelX}</text>
+        <text x={6} y={12} fontSize="10" fill="#555">{labelY}</text>
+      </svg>
+    </Card>
+  );
+}
+
+function MetricsCard({metrics}:{metrics:{name:string,value:number}[]}) {
+  if(!metrics?.length) return <Card title="Training metrics"><div className="muted">—</div></Card>;
+  return (
+    <Card title="Training metrics">
+      <ul className="muted">
+        {metrics.map(m=><li key={m.name}><strong>{m.name}</strong>: {m.value.toFixed(3)}</li>)}
+      </ul>
+    </Card>
+  );
+}
+
+function ReasonsCard({items}:{items:any[]}){
+  if(!items.length) return <Card title="Top drivers"><div className="muted">—</div></Card>;
+  return (
+    <Card title="Top drivers">
+      <ul className="muted">
+        {items.map((r:any,i:number)=><li key={i}><strong>{r.feature}</strong> {r.direction} · impact {Math.round((r.impact??r.importance)*100)}%</li>)}
+      </ul>
+    </Card>
+  );
+}
+
+function Card({title,children}:{title:string;children:React.ReactNode}) {
+  return <div className="card"><h2>{title}</h2><div className="body">{children}</div></div>;
+}

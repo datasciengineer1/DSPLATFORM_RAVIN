@@ -1,0 +1,37 @@
+'use client';
+import React from 'react';
+
+async function callLLM(payload:any){
+  try{
+    const r = await fetch('/api/explain/llm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+    return await r.json();
+  }catch{ return {text:''}; }
+}
+
+export default function ExplainPanel({rows,columns}:{rows:any[];columns:string[];}){
+  const [text,setText]=React.useState<string>('—');
+  const [busy,setBusy]=React.useState(false);
+
+  async function generate(){
+    setBusy(true);
+    try{
+      const cols = columns?.length? columns : (rows?.[0]? Object.keys(rows[0]) : []);
+      const prompt = [
+        'You are a senior data analyst. Produce a short, business-facing EDA summary.',
+        `Columns: ${cols.join(', ')}`,
+        'Write sections with **bold headers** and bullet points:',
+        '- **Overview** (1–2 lines)',
+        '- **Key findings** (bullets citing column names)',
+        '- **Suggested charts** (bullets)',
+        '- **Next actions** (bullets)'
+      ].join('\n');
+      const j = await callLLM({question:prompt, rows:(rows||[]).slice(0,120), kind:'eda'});
+      setText((j?.text||'').trim() || 'No insights yet.');
+    } finally { setBusy(false); }
+  }
+
+  React.useEffect(()=>{ if((rows?.length||0)>0){ generate(); } },[rows,columns]); // auto-run
+  return (
+    <div className="explain-box">{busy? 'Processing…' : text}</div>
+  );
+}

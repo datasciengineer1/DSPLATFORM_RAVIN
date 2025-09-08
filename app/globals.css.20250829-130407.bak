@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #__next { height: 100%; }
+:root { color-scheme: light dark; }
+body { @apply bg-gray-50 text-zinc-900; }
+.dark body { @apply bg-zinc-950 text-zinc-100; }
+
+@layer base {
+  textarea, input, select, button {
+    @apply bg-white text-zinc-900 dark:bg-zinc-900 dark:text-zinc-100;
+  }
+  textarea, input, select {
+    @apply border border-zinc-200 dark:border-zinc-800 rounded-xl;
+  }
+}

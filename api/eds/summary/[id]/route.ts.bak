@@ -1,0 +1,96 @@
+import { NextResponse } from 'next/server';
+import { getDataset, coerceRows, type Row } from '@/utils/datasets';
+
+export const dynamic = 'force-dynamic'; // avoids any static caching
+
+function isNumericSample(values: any[], sampleSize = 50, threshold = 0.8) {
+  let seen = 0, numeric = 0;
+  for (const v of values) {
+    if (v === null || v === undefined || v === '') continue;
+    seen++;
+    const n = typeof v === 'number' ? v : Number(String(v).replace(/,/g, ''));
+    if (Number.isFinite(n)) numeric++;
+    if (seen >= sampleSize) break;
+  }
+  return seen > 0 && numeric / seen >= threshold;
+}
+
+export async function GET(
+  _req: Request,
+  { params }: { params: { id: string } }
+) {
+  try {
+    const { id } = params;
+    const ds = await getDataset(id); // utils wrapper over loadDatasetSync
+    const rawRows: Row[] = Array.isArray((ds as any)?.rows) ? (ds as any).rows : [];
+    const rows = coerceRows(rawRows);
+
+    const columns = rows.length ? Object.keys(rows[0]!) : [];
+
+    const summary = columns.map((col) => {
+      const values = rows.map(r => r?.[col]);
+      const total = values.length;
+      const nulls = values.filter(v => v === null || v === undefined || v === '').length;
+      const nonNull = values.filter(v => v !== null && v !== undefined && v !== '');
+      const unique = new Set(nonNull.map(v => String(v))).size;
+
+      if (isNumericSample(values)) {
+        const nums = nonNull.map(v => (typeof v === 'number' ? v : Number(String(v).replace(/,/g, ''))))
+                            .filter(n => Number.isFinite(n)) as number[];
+        const count = nums.length;
+        const min = count ? Math.min(...nums) : null;
+        const max = count ? Math.max(...nums) : null;
+        const mean = count ? nums.reduce((a, b) => a + b, 0) / count : null;
+        const variance = count && mean !== null
+          ? nums.reduce((a, b) => a + Math.pow(b - (mean as number), 2), 0) / count
+          : null;
+        const std = variance !== null ? Math.sqrt(variance) : null;
+
+        // simple quantiles without external libs
+        const q = (p: number) => {
+          if (!count) return null;
+          const sorted = [...nums].sort((a, b) => a - b);
+          const idx = (sorted.length - 1) * p;
+          const lo = Math.floor(idx), hi = Math.ceil(idx);
+          if (lo === hi) return sorted[lo];
+          const w = idx - lo;
+          return sorted[lo] * (1 - w) + sorted[hi] * w;
+        };
+
+        return {
+          column: col,
+          type: 'number',
+          count,
+          nulls,
+          unique,
+          min,
+          p25: q(0.25),
+          mean,
+          p75: q(0.75),
+          max,
+          std,
+        };
+      } else {
+        const sample = nonNull.slice(0, 5);
+        return {
+          column: col,
+          type: 'string',
+          count: total,
+          nulls,
+          unique,
+          sample,
+        };
+      }
+    });
+
+    return NextResponse.json({
+      id: (ds as any)?.id ?? id,
+      name: (ds as any)?.name ?? 'dataset',
+      columns,
+      summary
+    });
+  } catch (err: any) {
+    console.error('EDS summary error:', err?.stack || err);
+    return new NextResponse('Failed to compute summary', { status: 500 });
+  }
+}

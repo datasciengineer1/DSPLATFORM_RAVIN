@@ -1,0 +1,64 @@
+'use client';
+import React from 'react';
+
+function quickProfile(rows:any[], columns:string[]){
+  const sample = rows?.slice(0,200) ?? [];
+  const cols = columns?.length? columns : (rows?.[0]? Object.keys(rows[0]) : []);
+  const isNum=(c:string)=> sample.some(r=> typeof r?.[c]==='number');
+  const isDate=(c:string)=> sample.some(r=>{
+    const v=r?.[c]; if(v instanceof Date) return true;
+    if(typeof v==='string'){ const d=new Date(v); return !isNaN(+d); } return false;
+  });
+  const num=cols.filter(isNum), date=cols.filter(isDate), cat=cols.filter(c=>!isNum(c)&&!isDate(c));
+  const miss=cols.map(c=>({c, n: sample.reduce((n,r)=>n+((r?.[c]===''||r?.[c]==null)?1:0),0)}))
+                 .sort((a,b)=>b.n-a.n)[0] ?? {c:'—',n:0};
+  return {cols, num, date, cat, miss, nRows: sample.length};
+}
+
+async function callLLM(payload:any){
+  const r = await fetch('/api/explain/llm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+  try { return await r.json(); } catch { return {text:''}; }
+}
+
+export default function ExplainPanel({step, rows, columns, nlq}:{step:number; rows:any[]; columns:string[]; nlq?:string}){
+  const [text,setText]=React.useState<string>('—');
+  const [busy,setBusy]=React.useState(false);
+
+  const prof = React.useMemo(()=> quickProfile(rows,columns),[rows,columns]);
+
+  async function generate(kind:'auto'|'manual'='manual'){
+    setBusy(true);
+    try{
+      const p = [
+        `You are an analyst writing a crisp, business-facing explainability note.`,
+        `Task: ${step<=2?'Explain EDA findings':'Summarize model predictions & drivers'}.`,
+        nlq? `User question: ${nlq}` : '',
+        `Columns: ${prof.cols.join(', ')}`,
+        `Numeric: ${prof.num.join(', ') || 'none'}`,
+        `Categorical: ${prof.cat.join(', ') || 'none'}`,
+        `Date-like: ${prof.date.join(', ') || 'none'}`,
+        `Missing-most: ${prof.miss.c} (${prof.miss.n} of ${prof.nRows})`,
+        `Write:\n- Overview (1–2 lines)\n- Key findings (bullets)\n- Chart suggestions (2–4 bullets; include field names)\n- Potential targets & NLQ suggestions (bullets)\n- Next actions (bullets)\nFormat with **section titles** and bullets. Be specific; no filler.`
+      ].filter(Boolean).join('\n');
+
+      const j = await callLLM({ question: p, rows: (rows||[]).slice(0,120), kind: step<=2?'eda':'predict' });
+      setText((j?.text||'').trim() || 'No insights returned.');
+    } finally { setBusy(false); }
+  }
+
+  // auto-run when data changes
+  React.useEffect(()=>{ if((rows?.length||0)>0){ generate('auto'); } },[rows,columns]); // eslint-disable-line
+
+  return (
+    <div className="card">
+      <h2>Explainability</h2>
+      <div className="body" style={{display:'grid',gap:8}}>
+        <div className="explain-box">{busy? 'Processing…' : text}</div>
+        <button className="btn" onClick={()=>generate('manual')} disabled={busy}>
+          {busy? 'Processing…' : 'Generate more insights'}
+        </button>
+        <div className="muted">Powered by your /api/explain/llm (Ollama/Open-source).</div>
+      </div>
+    </div>
+  );
+}

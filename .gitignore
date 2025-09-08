@@ -1,0 +1,23 @@
+node_modules/
+.next/
+out/
+dist/
+.vercel/
+.turbo/
+coverage/
+*.log
+pnpm-lock.yaml
+yarn.lock
+.DS_Store
+*.swp
+*backup*/
+*_backup*/
+* - Copy*/
+*.zip
+data/uploads/
+data/cache/
+tmp/
+.venv/
+__pycache__/
+*.pyc
+.env*

@@ -1,0 +1,59 @@
+'use client';
+import React from 'react';
+
+function summarize(rows:any[], columns:string[]){
+  const sample = rows?.slice(0,200) ?? [];
+  const cols = columns?.length ? columns : (rows?.[0] ? Object.keys(rows[0]) : []);
+  const isNum=(c:string)=> sample.some(r=> typeof r?.[c]==='number');
+  const isDate=(c:string)=> sample.some(r=>{
+    const v=r?.[c]; if(v instanceof Date) return true;
+    if(typeof v==='string'){ const d=new Date(v); return !isNaN(+d); } return false;
+  });
+
+  const numCols=cols.filter(isNum);
+  const dateCols=cols.filter(isDate);
+  const catCols=cols.filter(c=>!isNum(c)&&!isDate(c));
+
+  let mostMissing = {col:'—', miss:0};
+  cols.forEach(c=>{
+    const miss = sample.reduce((n,r)=> n + ((r?.[c]===null || r?.[c]===undefined || r?.[c]==='')?1:0), 0);
+    if(miss>mostMissing.miss) mostMissing={col:c, miss};
+  });
+
+  return [
+    `**EDA overview**`,
+    `• Rows previewed: ${sample.length}, Columns: ${cols.length}`,
+    `• Numeric: ${numCols.length} · Categorical: ${catCols.length}`,
+    `• Most missing: ${mostMissing.col} (${mostMissing.miss})`,
+    dateCols.length? `• Trend: date-like column detected (${dateCols[0]})` : `• Trend: no obvious date column`,
+    `• Next: explore charts; suggested NLQ appears at right.`
+  ].join('\n');
+}
+
+export default function ExplainPanel({step, rows, columns, nlq}:{step:number; rows:any[]; columns:string[]; nlq?:string}){
+  const [text,setText]=React.useState<string>(summarize(rows,columns));
+  const [busy,setBusy]=React.useState(false);
+
+  React.useEffect(()=>{ setText(summarize(rows,columns)); },[rows,columns]);
+
+  async function generate(){
+    setBusy(true);
+    try{
+      const j = await fetch('/api/explain/llm',{
+        method:'POST', headers:{'content-type':'application/json'},
+        body: JSON.stringify({ question: nlq||'Explain the EDA succinctly with key findings.', rows: (rows||[]).slice(0,120), kind: step<=2?'eda':'predict' })
+      }).then(r=>r.json()).catch(()=>({text:''}));
+      setText((j?.text||'').trim() || summarize(rows,columns));
+    } finally { setBusy(false); }
+  }
+
+  return (
+    <div className="card">
+      <h2>Explainability</h2>
+      <div className="body" style={{display:'grid', gap:8}}>
+        <div className="explain-box">{text}</div>
+        <button className="btn" onClick={generate} disabled={busy}>{busy?'Processing…':'Generate more insights'}</button>
+      </div>
+    </div>
+  );
+}

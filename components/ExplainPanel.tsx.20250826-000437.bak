@@ -1,0 +1,65 @@
+'use client';
+import React from 'react';
+
+type Mode = 'eda'|'predict';
+
+async function callLLM(payload:any){
+  try{
+    const r = await fetch('/api/explain/llm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+    return await r.json();
+  }catch{ return {text:''}; }
+}
+
+function fallbackEDA(rows:any[], columns:string[]){
+  const sample=rows?.slice(0,200)??[];
+  const cols = columns?.length?columns:(sample[0]?Object.keys(sample[0]):[]);
+  return [
+    '**EDA overview**',
+    `• Rows previewed: ${sample.length}, Columns: ${cols.length}`,
+    '• Next: explore charts and NLQ questions at center.'
+  ].join('\n');
+}
+
+export default function ExplainPanel({
+  mode, rows, columns, nlq, textFromCenter
+}:{mode:Mode; rows:any[]; columns:string[]; nlq?:string; textFromCenter?:string;}){
+  const [text,setText]=React.useState<string>(mode==='eda'?fallbackEDA(rows,columns):'—');
+  const [busy,setBusy]=React.useState(false);
+
+  async function generate(){
+    setBusy(true);
+    try{
+      if(mode==='predict' && textFromCenter){
+        setText(textFromCenter);
+      }else{
+        const prompt = [
+          'You are a senior data analyst. Write a crisp, business-facing note.',
+          mode==='eda'
+            ? 'Task: Explain the EDA of the uploaded tabular data with key findings.'
+            : `Task: Summarize model predictions and drivers. Question: ${nlq||'—'}`,
+          'Format:',
+          '- **Overview** (1–2 lines)',
+          '- **Key findings** (bullets; cite column names)',
+          '- **Chart suggestions** (2–4 bullets)',
+          '- **Next actions** (bullets)'
+        ].join('\n');
+        const j = await callLLM({question:prompt, rows:(rows||[]).slice(0,120), kind: mode});
+        setText((j?.text||'').trim() || (mode==='eda'?fallbackEDA(rows,columns):'No insights yet.'));
+      }
+    } finally { setBusy(false); }
+  }
+
+  React.useEffect(()=>{ if(mode==='eda' && (rows?.length||0)>0){ generate(); } },[mode, rows, columns]); // auto for EDA
+
+  return (
+    <div className="card">
+      <h2>Explainability</h2>
+      <div className="body" style={{display:'grid',gap:8}}>
+        <div className="explain-box">{busy?'Processing…':text}</div>
+        <button className="btn" onClick={generate} disabled={busy}>
+          {busy? 'Processing…' : 'Generate more insights'}
+        </button>
+      </div>
+    </div>
+  );
+}

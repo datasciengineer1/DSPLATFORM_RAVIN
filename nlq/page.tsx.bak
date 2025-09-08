@@ -1,0 +1,286 @@
+"use client";
+
+import React, { useEffect, useRef, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import StepNav from "@/components/ui/StepNav";
+import RecommendationsPanel from "@/components/RecommendationsPanel";
+import { detectTask } from "@/utils/nlq";
+
+/* ───────────────── Retrieval diagnostics types + helper ───────────────── */
+
+type RetrievalDiag = {
+  enabled: boolean;
+  backend?: "edge-wasm" | "node-wasm";
+  embedder?: { name: string; dim: number; multilingual?: boolean };
+  reranker?: { name?: string; enabled: boolean; error?: string };
+  topk?: number;
+  items?: Array<{ id: string; title?: string; embedScore: number; rerankScore?: number }>;
+  metrics?: { ndcg_embed?: number; ndcg_rerank?: number };
+  explain?: string[];
+  error?: string;
+};
+
+async function getRetrievalDiag(q: string, datasetId: string): Promise<RetrievalDiag | null> {
+  try {
+    const res = await fetch("/api/diag/retrieval", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ q, datasetId }),
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch {
+    return null;
+  }
+}
+
+/* ───────────────────────────────── Component ───────────────────────────────── */
+
+export default function NLQPage() {
+  const router = useRouter();
+  const sp = useSearchParams();
+
+  // UI state
+  const [q, setQ] = useState(
+    "What is the sales forecast for next 2 quarters based on last 2 years of data?"
+  );
+  const [dataset, setDataset] = useState<string | null>(null);
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState<string>("");
+
+  // retrieval transparency
+  const [diag, setDiag] = useState<RetrievalDiag | null>(null);
+
+  // request guards (prevent race/double update)
+  const nlqAbortRef = useRef<AbortController | null>(null);
+  const nlqReqIdRef = useRef(0);
+
+  // Resolve dataset from URL or session
+  useEffect(() => {
+    const datasetFromUrl = sp.get("dataset") || sp.get("id");
+    const s =
+      datasetFromUrl ||
+      (typeof window !== "undefined"
+        ? sessionStorage.getItem("currentDatasetId")
+        : null);
+    setDataset(s || null);
+  }, [sp]);
+
+  // Fetch retrieval diagnostics whenever question or dataset changes
+  useEffect(() => {
+    if (!dataset || !q) {
+      setDiag(null);
+      return;
+    }
+    let cancelled = false;
+    getRetrievalDiag(q, dataset).then((d) => {
+      if (!cancelled) setDiag(d);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [q, dataset]);
+
+  async function onAnalyze() {
+    if (analyzing) return;
+    setError("");
+
+    const ds = dataset || "demo";
+    const task = detectTask(q || "");
+
+    // cancel any in-flight request
+    nlqAbortRef.current?.abort?.();
+    const aborter = new AbortController();
+    nlqAbortRef.current = aborter;
+    const reqId = ++nlqReqIdRef.current;
+
+    setAnalyzing(true);
+
+    try {
+      // 1) Primary path: lightweight NLQ preview
+      const r1 = await fetch("/api/nlq", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ query: q, datasetId: ds }),
+        signal: aborter.signal,
+        cache: "no-store",
+      });
+
+      if (!r1.ok) throw new Error(`NLQ HTTP ${r1.status}`);
+      const json = await r1.json();
+
+      if (nlqReqIdRef.current === reqId) {
+        // Persist for the Predict step to read
+        if (typeof window !== "undefined") {
+          sessionStorage.setItem("nlq.sql", json?.sql ?? "");
+          sessionStorage.setItem("nlq.rows", JSON.stringify(json?.rows ?? []));
+          sessionStorage.setItem("nlq.question", q);
+          sessionStorage.setItem("nlq.datasetId", ds);
+        }
+        router.push(
+          `/predict?dataset=${encodeURIComponent(
+            ds
+          )}&task=${encodeURIComponent(task)}&q=${encodeURIComponent(q)}`
+        );
+      }
+    } catch (_primaryErr) {
+      // 2) Fallback: Ollama explain endpoint
+      try {
+        const r2 = await fetch("/api/explain/llm", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            question: q,
+            datasetId: ds,
+            context:
+              "Return business-friendly insights with drivers, caveats, and next actions.",
+          }),
+          signal: aborter.signal,
+          cache: "no-store",
+        });
+
+        if (!r2.ok) throw new Error(`Explain HTTP ${r2.status}`);
+        const ex = await r2.json();
+
+        if (nlqReqIdRef.current === reqId) {
+          if (typeof window !== "undefined") {
+            sessionStorage.setItem("nlq.answer", ex?.answer ?? "");
+            sessionStorage.setItem("nlq.provider", ex?.provider ?? "ollama");
+            sessionStorage.setItem("nlq.question", q);
+            sessionStorage.setItem("nlq.datasetId", ds);
+          }
+          router.push(
+            `/predict?dataset=${encodeURIComponent(
+              ds
+            )}&task=${encodeURIComponent(task)}&q=${encodeURIComponent(q)}`
+          );
+        }
+      } catch (fallbackErr: any) {
+        if (nlqReqIdRef.current === reqId) {
+          setError(fallbackErr?.message || "Analyze failed");
+        }
+      }
+    } finally {
+      if (nlqReqIdRef.current === reqId) setAnalyzing(false);
+    }
+  }
+
+  return (
+    <main className="container mx-auto px-4 py-4">
+      <StepNav active="nlq" />
+
+      <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-md border border-zinc-100 dark:border-zinc-800 p-4">
+        <div className="text-lg font-semibold mb-3">Step 4: NLQ</div>
+
+        <textarea
+          className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 p-3"
+          rows={3}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Ask a question about your data…"
+        />
+
+        {/* Suggestions */}
+        <h2 className="text-sm font-semibold mb-2 mt-3">Suggestions</h2>
+        <RecommendationsPanel
+          task={detectTask(q)}
+          target={undefined}
+          onPick={(text) => setQ(text)}
+        />
+
+        <div className="flex gap-2 mt-3">
+          <button
+            type="button"
+            onClick={onAnalyze}
+            disabled={analyzing || !q}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 text-white disabled:opacity-60"
+          >
+            {analyzing ? "Analyzing…" : "Analyze question"}
+          </button>
+          <button
+            type="button"
+            onClick={() => router.back()}
+            className="px-3 py-1.5 rounded-lg border"
+          >
+            Back
+          </button>
+        </div>
+
+        {/* Retrieval transparency */}
+        <h2 className="text-sm font-semibold mb-2 mt-6">Retrieval transparency</h2>
+        {!diag?.enabled ? (
+          <div className="text-sm text-zinc-500">
+            Disabled{diag?.error ? ` (${diag.error})` : ""}. Ensure <code>@xenova/transformers</code> is installed and
+            <code> /api/diag/retrieval</code> is reachable.
+          </div>
+        ) : (
+          <div className="text-sm space-y-2">
+            <div>
+              Embedder: <b>{diag.embedder?.name}</b> ({diag.embedder?.dim}d)
+              {diag.embedder?.multilingual ? " · multilingual" : ""}
+            </div>
+            <div>
+              Reranker:{" "}
+              {diag.reranker?.enabled ? (
+                <b>{diag.reranker?.name}</b>
+              ) : (
+                <span className="text-zinc-500">
+                  disabled{diag.reranker?.name ? ` (${diag.reranker?.name})` : ""}
+                  {diag.reranker?.error ? ` — ${diag.reranker?.error}` : ""}
+                </span>
+              )}
+            </div>
+
+            {!!diag.items?.length && (
+              <div className="overflow-x-auto border border-zinc-200 dark:border-zinc-800 rounded-lg">
+                <table className="w-full text-xs">
+                  <thead className="bg-zinc-50 dark:bg-zinc-900/50">
+                    <tr>
+                      <th className="text-left p-2">Doc</th>
+                      <th className="text-right p-2">embedScore</th>
+                      <th className="text-right p-2">rerankScore</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {diag.items.slice(0, 5).map((it, i) => (
+                      <tr key={i} className="border-t border-zinc-100 dark:border-zinc-800">
+                        <td className="p-2">{it.title}</td>
+                        <td className="p-2 text-right">{it.embedScore.toFixed(3)}</td>
+                        <td className="p-2 text-right">
+                          {it.rerankScore != null ? it.rerankScore.toFixed(3) : "—"}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            <div className="flex flex-wrap gap-4 text-xs text-zinc-500">
+              {diag.metrics?.ndcg_embed != null && <span>nDCG (embed): {diag.metrics.ndcg_embed.toFixed(3)}</span>}
+              {diag.metrics?.ndcg_rerank != null && <span>nDCG (rerank): {diag.metrics.ndcg_rerank.toFixed(3)}</span>}
+            </div>
+
+            {diag.explain?.length ? (
+              <ul className="list-disc ml-5 text-xs text-zinc-500 space-y-1">
+                {diag.explain.map((s, i) => (
+                  <li
+                    key={i}
+                    dangerouslySetInnerHTML={{ __html: s.replace(/\*\*(.+?)\*\*/g, "<b>$1</b>") }}
+                  />
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        )}
+
+        <div className="mt-3 text-sm text-zinc-500">
+          Detected dataset: <span className="font-medium">{dataset ?? "(none)"}</span>
+        </div>
+
+        {error && <div className="mt-3 text-sm text-red-600">{error}</div>}
+      </div>
+    </main>
+  );
+}

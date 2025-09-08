@@ -1,0 +1,18 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Base dark theme so your previous look returns */
+:root { color-scheme: dark; }
+html, body { @apply bg-neutral-950 text-neutral-100; }
+
+/* Page padding and nicer type */
+main { @apply p-4 md:p-6 lg:p-8; }
+h1,h2,h3 { @apply font-semibold tracking-tight; }
+h2 { @apply text-lg md:text-xl; }
+
+/* Generic card + section helpers (non-breaking) */
+.section { @apply bg-neutral-900/40 border border-neutral-800 rounded-2xl p-4 md:p-6; }
+
+/* If any chart wrappers use a % height, ensure a minimum so Recharts can render */
+.chart-box { @apply w-full min-h-72; } /* ~288px */

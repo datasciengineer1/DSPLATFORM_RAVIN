@@ -1,0 +1,81 @@
+'use client';
+import React, {useEffect, useState} from 'react';
+
+type Row = Record<string, any>;
+function isNum(x:any){ return typeof x==='number' && Number.isFinite(x); }
+function asDate(x:any){ const d = new Date(x); return isNaN(+d)? null : d; }
+
+export default function ExplainPanel({
+  step, rows, columns, nlq
+}:{ step:number; rows:Row[]; columns:string[]; nlq?:string }){
+  const [text,setText]=useState<string>('—');
+  const [loading,setLoading]=useState(false);
+
+  // Listen for Predictor's explanations in Step 6 (model/predict)
+  useEffect(()=>{
+    const onUpdate = (e:any)=>{ const t = e?.detail?.text; if(t) setText(t); };
+    window.addEventListener('explain:update', onUpdate);
+    return ()=> window.removeEventListener('explain:update', onUpdate);
+  },[]);
+
+  // Build a readable EDA write-up for Step 2
+  useEffect(()=>{
+    if(step!==2){ return; }
+    setLoading(true);
+    try{
+      const n = rows?.length||0;
+      const cols = columns||[];
+      const sample = rows?.slice(0,200) || [];
+
+      const numeric = cols.filter(c=> sample.some(r=>isNum(r[c])));
+      const categorical = cols.filter(c=> !numeric.includes(c));
+
+      // missingness (top 3)
+      const miss = cols.map(c=>{
+        const m = sample.filter(r=>r[c]===null || r[c]===undefined || r[c]==='').length;
+        return {c, pct: Math.round(100*m/Math.max(1,sample.length))};
+      }).sort((a,b)=>b.pct-a.pct).slice(0,3);
+
+      // simple trend hint if a date column exists
+      const dateCol = cols.find(c => c.toLowerCase().includes('date') || c.toLowerCase().includes('month'));
+      let trendHint = '';
+      if(dateCol){
+        const bucket = new Map<string, number>();
+        const metric = numeric[0];
+        sample.forEach(r=>{
+          const d = asDate(r[dateCol]); const v = r[metric];
+          if(!d || !isNum(v)) return;
+          const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+          bucket.set(k, (bucket.get(k)||0) + v);
+        });
+        const series = Array.from(bucket.entries()).sort((a,b)=>a[0].localeCompare(b[0]));
+        if(series.length>1){
+          const last = series[series.length-1][1], prev = series[series.length-2][1];
+          const mom = prev? (last/prev-1)*100 : 0;
+          trendHint = `• Recent trend in ${dateCol}: ${series[series.length-1][0]} vs prev ${(mom).toFixed(1)}%.`;
+        }
+      }
+
+      const lines = [
+        `**EDA overview**`,
+        `• Rows previewed: ${n}, Columns: ${cols.length}`,
+        `• Numeric: ${numeric.length} · Categorical: ${categorical.length}`,
+        miss[0]?.pct ? `• Most missing: ${miss.map(x=>`${x.c} ${x.pct}%`).join(', ')}` : '• Missing values: low/none detected',
+        trendHint || '• Trend: no obvious date trend detected in preview',
+        `• Next: explore charts; suggested NLQ appears at right.`,
+      ];
+      setText(lines.join('\n'));
+    } finally { setLoading(false); }
+  },[step, rows, columns]);
+
+  return (
+    <div className="card">
+      <h2>Explainability</h2>
+      <div className="body">
+        {loading
+          ? <div className="loading"><span className="spinner"></span><span>Building EDA summary…</span></div>
+          : <pre className="explain-box" style={{whiteSpace:'pre-wrap',margin:0}}>{text}</pre>}
+      </div>
+    </div>
+  );
+}

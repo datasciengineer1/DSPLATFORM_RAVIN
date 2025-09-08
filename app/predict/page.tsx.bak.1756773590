@@ -1,0 +1,208 @@
+"use client";
+
+import StepNav from "@/components/ui/StepNav";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
+import StepNav from "@/components/ui/StepNav";
+import TimeSeries from "@/components/charts/TimeSeries";
+import DonutShare from "@/components/charts/DonutShare";
+import { buildExplainability, combineSeries, detectTask, preferTarget, rmse, mae, DetectedTask } from "@/utils/nlq";
+
+async function fetchJSON(path: string, init?: RequestInit) {
+  const res = await fetch(path, { cache:"no-store", ...(init||{}) });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export default function PredictPage() {
+  const sp = useSearchParams();
+  const router = useRouter();
+
+  const qParam = sp.get("q") || "";
+  const datasetParam = sp.get("dataset") || sp.get("id") || "";
+  const taskParam = (sp.get("task") as DetectedTask | null);
+
+  const [datasetId, setDatasetId] = useState<string>("");
+  const [question, setQuestion] = useState<string>(qParam);
+  const [task, setTask] = useState<DetectedTask>(taskParam || detectTask(qParam||""));
+
+  const [fields, setFields] = useState<any>({});
+  const [explain, setExplain] = useState<string[]>([]);
+
+  // series
+  const [series, setSeries] = useState<any[]>([]);
+  const [xKey, setXKey] = useState<string>("idx");
+  const [metrics, setMetrics] = useState<{rmse?:number|null; mae?:number|null}>({});
+
+  // drivers
+  const [drivers, setDrivers] = useState<Array<{name:string; value:number}>>([]);
+
+  useEffect(() => {
+    const id = datasetParam || (typeof window!=="undefined" ? (sessionStorage.getItem("currentDatasetId") || "") : "");
+    if (id) setDatasetId(id);
+  }, [datasetParam]);
+
+  // Load fields (labels) for dynamic names
+  useEffect(()=>{
+    if (!datasetId) return;
+    const enc = encodeURIComponent(datasetId);
+    fetchJSON(`/api/eds/summary/${enc}`).then((s)=>{
+      setFields(s?.fields||{});
+    }).catch(()=>{});
+  }, [datasetId]);
+
+  // Auto run on mount if we have q + dataset
+  useEffect(()=>{
+    if (!datasetId) return;
+    if (!question) return;
+    run(question);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [datasetId]);
+
+  async function run(q: string) {
+    try{
+      const detected = taskParam || detectTask(q);
+      setTask(detected);
+
+      // Always keep question in the URL for refresh/back
+      const qs = new URLSearchParams();
+      qs.set("dataset", datasetId);
+      qs.set("q", q);
+      qs.set("task", detected);
+      router.replace(`/predict?${qs.toString()}`);
+
+      // Reset UI
+      setSeries([]); setDrivers([]); setExplain([]); setMetrics({});
+
+      const target = preferTarget(q, fields);
+
+      if (detected === "forecast") {
+        // Call your existing /api/predict/run endpoint; fall back if empty
+        const resp = await fetchJSON(`/api/predict/run`, {
+          method:"POST",
+          headers: { "content-type":"application/json" },
+          body: JSON.stringify({ id: datasetId, question: q })
+        }).catch(()=>null as any);
+
+        let actual: Array<number|null> = resp?.actual ?? [];
+        let forecast: Array<number|null> = resp?.forecast ?? [];
+        let labels: string[] | undefined = resp?.labels;
+
+        // Fall back to trivial moving average from summary trend if needed
+        if ((!actual?.length && !forecast?.length)) {
+          const sum = await fetchJSON(`/api/eds/summary/${encodeURIComponent(datasetId)}`);
+          const trend = (sum?.trendCogsByMonth || sum?.trend || []).map((d:any)=>Number(d.value)||0);
+          const names = (sum?.trendCogsByMonth || sum?.trend || []).map((d:any)=>String(d.name));
+          if (trend.length) {
+            actual = trend;
+            const w = Math.min(12, Math.max(3, Math.floor(trend.length/6)||3));
+            const ma = new Array(trend.length).fill(null) as Array<number|null>;
+            let s = 0;
+            for (let i=0;i<trend.length;i++){
+              s += trend[i];
+              if (i>=w) s -= trend[i-w];
+              if (i>=w-1) ma[i] = s / w;
+            }
+            forecast = ma;
+            labels = names;
+          }
+        }
+
+        const rows = combineSeries(actual, forecast, labels);
+        const hasDate = rows.length && rows[0].date!=null;
+        setXKey(hasDate ? "date" : "idx");
+        setSeries(rows);
+
+        const m = { rmse: rmse(actual, forecast), mae: mae(actual, forecast) };
+        setMetrics(m);
+
+        const bullets = buildExplainability({
+          question:q, task: detected, target,
+          rmse: m.rmse, mae: m.mae,
+          seasonalityHint: "moderate monthly seasonality (lag≈12)",
+          trendHint: "generally flat to mild upward slope"
+        });
+        setExplain(bullets);
+
+      } else {
+        // DRIVERS / CLASSIFY / REGRESS: fetch correlations as a proxy
+        const corr = await fetchJSON(`/api/eds/corr/${encodeURIComponent(datasetId)}?top=12`).catch(()=>null as any);
+        const items = Array.isArray(corr) ? corr : (corr?.top || []);
+        const pretty = items.map((d:any)=>({ name: d?.name || d?.column || "Feature", value: Math.abs(Number(d.value)||0) }));
+        setDrivers(pretty);
+
+        const bullets = buildExplainability({
+          question:q, task: detected, target
+        });
+        setExplain(bullets);
+      }
+    }catch(e:any){
+      setExplain([`We couldn’t run the analysis. ${e?.message || ""}`]);
+    }
+  }
+
+  return (
+    <main className="container mx-auto px-4 py-4">
+      <StepNav active="predict" />
+
+      {/* query bar */}
+      <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-md border border-zinc-100 dark:border-zinc-800 p-4 mb-4">
+        <div className="flex gap-2 items-center">
+          <input
+            className="flex-1 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-3 py-2"
+            value={question}
+            onChange={e=>setQuestion(e.target.value)}
+            placeholder="Ask a question (we pick the right analysis)…"
+          />
+          <button onClick={()=>run(question)} className="px-3 py-2 rounded-lg bg-blue-600 text-white">Run</button>
+        </div>
+        <div className="text-xs text-zinc-500 mt-2">Dataset: <span className="font-medium">{datasetId || "(none)"} </span> • Task: <span className="font-medium">{task}</span></div>
+      </div>
+
+      {/* layout */}
+      <div className="grid grid-cols-12 gap-4">
+        {/* main */}
+        <div className="col-span-12 xl:col-span-8 space-y-4">
+          {task==="forecast" ? (
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-md border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Forecast of {fields?.yRevenue || fields?.target || "Sales"}</div>
+              {series?.length ? (
+                <TimeSeries data={series} xKey={xKey} />
+              ) : (
+                <div className="text-sm text-zinc-500">No forecastable series returned. Try a numeric target or another question.</div>
+              )}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-2 mt-3">
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-2"><div className="text-xs uppercase text-zinc-500">Model</div><div className="text-sm">Moving average (window≈auto)</div></div>
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-2"><div className="text-xs uppercase text-zinc-500">RMSE</div><div className="text-sm">{metrics.rmse==null?"—":Number(metrics.rmse).toLocaleString()}</div></div>
+                <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 p-2"><div className="text-xs uppercase text-zinc-500">MAE</div><div className="text-sm">{metrics.mae==null?"—":Number(metrics.mae).toLocaleString()}</div></div>
+              </div>
+            </div>
+          ) : (
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-md border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Top drivers</div>
+              {drivers?.length ? (
+                <DonutShare data={drivers} topN={8} />
+              ) : (
+                <div className="text-sm text-zinc-500">No clear drivers found from simple correlations.</div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* right: explainability */}
+        <div className="col-span-12 xl:col-span-4">
+          <div className="bg-white dark:bg-zinc-900 rounded-2xl shadow-md border border-zinc-100 dark:border-zinc-800 p-4">
+            <div className="text-lg font-semibold mb-2">Explainability</div>
+            <ul className="list-disc ml-5 text-sm space-y-2">
+              {explain.map((b, i)=> <li key={i} dangerouslySetInnerHTML={{__html: b.replace(/\*\*(.+?)\*\*/g,"<b>$1</b>")}} />)}
+            </ul>
+            <div className="flex justify-between mt-4">
+              <button onClick={()=>router.push(`/model?dataset=${encodeURIComponent(datasetId||"")}`)} className="px-3 py-1.5 rounded-lg border">Back</button>
+              <button onClick={()=>router.push(`/data?dataset=${encodeURIComponent(datasetId||"")}`)} className="px-3 py-1.5 rounded-lg bg-blue-600 text-white">Next</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}

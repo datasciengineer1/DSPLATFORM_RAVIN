@@ -1,0 +1,91 @@
+'use client';
+import React from 'react';
+
+type Row = Record<string, any>;
+
+async function callLLM(payload:any){
+  try{
+    const r = await fetch('/api/explain/llm',{
+      method:'POST',
+      headers:{'content-type':'application/json'},
+      body:JSON.stringify(payload)
+    });
+    if(!r.ok) throw new Error(String(r.status));
+    return await r.json();
+  }catch{ return { text: '' }; }
+}
+
+/** Heuristic fallback: concise, business-readable EDA summary (no LLM needed). */
+function localSummary(rows:Row[], columns:string[]){
+  const n = rows.length;
+  if(!n || !columns.length) return '**EDA overview**\n• No data yet. Upload or connect a source.';
+  const head = rows.slice(0, Math.min(n, 500));
+  const numerics = columns.filter(c => head.some(r => typeof r?.[c] === 'number')).slice(0, 6);
+  const categoricals = columns.filter(c => head.some(r => r?.[c]!=null && typeof r?.[c] !== 'number')).slice(0, 6);
+  const bullets:string[] = [];
+
+  numerics.forEach(c=>{
+    const vals = head.map(r=>r?.[c]).filter((v:any)=>typeof v==='number');
+    if(!vals.length) return;
+    const mean = vals.reduce((s,v)=>s+v,0)/vals.length;
+    const min = Math.min(...vals), max = Math.max(...vals);
+    bullets.push(`• **${c}**: avg ≈ ${mean.toFixed(2)} (range ${min.toFixed(2)}–${max.toFixed(2)})`);
+  });
+
+  categoricals.forEach(c=>{
+    const freq = new Map<string, number>();
+    head.forEach(r=>{ const k = String(r?.[c] ?? '—'); freq.set(k, (freq.get(k)||0)+1); });
+    const top = [...freq.entries()].sort((a,b)=>b[1]-a[1]).slice(0,3)
+      .map(([k,v])=> `${k} (${((v/n)*100).toFixed(1)}%)`);
+    bullets.push(`• **${c}**: top categories → ${top.join(', ')}`);
+  });
+
+  const body = bullets.length ? bullets.join('\n') : '• No strong signals detected in the preview.';
+  return [
+    '**EDA overview**',
+    `• Rows previewed: ${n}, Columns: ${columns.length}`,
+    '• Key findings:',
+    body,
+    '• Suggested next steps:',
+    '  - Verify distributions/outliers in EDA charts.',
+    '  - Proceed to NLQ when EDA looks reasonable.'
+  ].join('\n');
+}
+
+export default function ExplainPanel({rows,columns}:{rows:Row[];columns:string[];}){
+  const [text,setText]=React.useState<string>('—');
+  const [busy,setBusy]=React.useState(false);
+
+  async function generate(){
+    setBusy(true);
+    try{
+      const prompt = [
+        'You are a senior data analyst. Write a SHORT, readable EDA note.',
+        `Columns: ${columns.join(', ') || '(none)'}`,
+        'Use this structure with markdown:',
+        '- **Overview** (1–2 lines)',
+        '- **Key findings** (5–8 bullets; say what and why)',
+        '- **Chart ideas** (3–5 bullets)',
+        '- **Next actions** (3–5 bullets)',
+        'Avoid raw dumps; speak like a business analyst.'
+      ].join('\n');
+
+      const j = await callLLM({question:prompt, rows:(rows||[]).slice(0,200), kind:'eda'});
+      const llm = (j?.text||'').trim();
+      setText(llm || localSummary(rows,columns));
+    } finally { setBusy(false); }
+  }
+
+  React.useEffect(()=>{ if((rows?.length||0)>0){ generate(); } },[rows,columns]);
+
+  return (
+    <div style={{display:'grid',gap:8}}>
+      <div className="explain-box" style={{minHeight:140, whiteSpace:'pre-wrap'}}>
+        {busy? 'Processing…' : (text || '—')}
+      </div>
+      <button className="btn" onClick={generate} disabled={busy}>
+        {busy? 'Processing…' : 'Regenerate'}
+      </button>
+    </div>
+  );
+}

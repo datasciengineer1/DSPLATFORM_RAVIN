@@ -1,0 +1,52 @@
+'use client';
+import React from 'react';
+
+async function callLLM(payload:any){
+  try{
+    const r = await fetch('/api/explain/llm',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(payload)});
+    return await r.json();
+  }catch{ return {text:''}; }
+}
+
+export default function ExplainPanel({rows,columns}:{rows:any[];columns:string[];}){
+  const [text,setText]=React.useState<string>('—');
+  const [busy,setBusy]=React.useState(false);
+
+  const numeric = React.useMemo(()=>{
+    const n = columns.filter(c=> rows.some(r=> typeof r?.[c]==='number'));
+    return n.slice(0,6);
+  },[rows,columns]);
+  const categorical = React.useMemo(()=>{
+    const c = columns.filter(c=> rows.some(r=> typeof r?.[c]!=='number' && typeof r?.[c] !== 'object'));
+    return c.slice(0,6);
+  },[rows,columns]);
+
+  async function generate(){
+    setBusy(true);
+    try{
+      const prompt = [
+        'You are a senior data analyst. Write a concise, human-readable EDA narrative (no code).',
+        `Columns: ${columns.join(', ') || '(none)'}`,
+        `Numeric candidates: ${numeric.join(', ') || '(none)'}`,
+        `Categorical candidates: ${categorical.join(', ') || '(none)'}`,
+        'Structure:',
+        '- **Overview**: what this dataset likely represents',
+        '- **Key findings**: 5–8 bullets with plain-language takeaways (trends, outliers, seasonality, skew, category dominance).',
+        '- **Chart ideas**: 3–5 bullets (bar/line/scatter/pie) with column names.',
+        '- **Actions**: 3–5 bullets for the business stakeholder.',
+        'Avoid raw dumps of numbers; speak in business terms.'
+      ].join('\n');
+      const j = await callLLM({question:prompt, rows:(rows||[]).slice(0,120), kind:'eda'});
+      setText((j?.text||'').trim() || 'No insights yet.');
+    } finally { setBusy(false); }
+  }
+
+  React.useEffect(()=>{ if((rows?.length||0)>0){ generate(); } },[rows,columns]);
+
+  return (
+    <div style={{display:'grid',gap:8}}>
+      <div className="explain-box" style={{minHeight:140}}>{busy? 'Processing…' : text}</div>
+      <button className="btn" onClick={generate} disabled={busy}>{busy? 'Processing…' : 'Regenerate'}</button>
+    </div>
+  );
+}

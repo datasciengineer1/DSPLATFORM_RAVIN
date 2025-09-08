@@ -1,0 +1,169 @@
+'use client';
+import React, { useMemo, useState } from 'react';
+import {
+  ResponsiveContainer, BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid,
+  LineChart, Line, PieChart, Pie, Cell, ScatterChart, Scatter
+} from 'recharts';
+
+const COLORS = ['#4f46e5','#0ea5e9','#22c55e','#f59e0b','#ef4444','#14b8a6','#8b5cf6','#e11d48'];
+
+export default function EDACompact({ rows = [], columns = [] as string[] }:{
+  rows:any[]; columns:string[];
+}) {
+  const [page,setPage] = useState(1);
+  const pageSize = 15;
+  const totalPages = Math.max(1, Math.ceil((rows?.length||0)/pageSize));
+
+  const sample = useMemo(()=> rows.slice(0, Math.min(rows.length, 1000)), [rows]);
+  const cols   = useMemo(()=> (columns?.length?columns:(rows[0]?Object.keys(rows[0]):[])), [columns, rows]);
+
+  const isNum=(c:string)=> sample.some(r=> typeof r?.[c]==='number');
+  const isDateish=(c:string)=> sample.some(r=>{
+    const v=r?.[c]; if(v instanceof Date) return true;
+    if(typeof v==='string'){ const d=new Date(v); return !isNaN(+d); } return false;
+  });
+
+  const numCols  = cols.filter(isNum);
+  const catCols  = cols.filter(c=> !isNum(c) && !isDateish(c));
+  const dateCols = cols.filter(isDateish);
+
+  // Histogram
+  const histCol = numCols[0];
+  const hist = useMemo(()=>{
+    if(!histCol) return [];
+    const vals=sample.map(r=>r[histCol]).filter((v:any)=>typeof v==='number');
+    if(!vals.length) return [];
+    const min=Math.min(...vals), max=Math.max(...vals);
+    const bins=Math.min(20, Math.max(5, Math.ceil(Math.sqrt(vals.length))));
+    const w=(max-min)/(bins||1)||1, arr=Array.from({length:bins},(_,i)=>({x:min+i*w,n:0}));
+    vals.forEach(v=>{ let i=Math.floor((v-min)/w); if(i>=bins)i=bins-1; if(i<0)i=0; arr[i].n++; });
+    return arr.map(d=>({bin:Number.isFinite(d.x)?d.x.toFixed(2):d.x, count:d.n}));
+  },[sample, histCol]);
+
+  // Counts (small-cardinality categorical)
+  const catCol=useMemo(()=>{
+    for(const c of catCols){ const uniq=new Set(sample.map(r=>r?.[c])).size; if(uniq>1 && uniq<=12) return c; }
+    return catCols[0];
+  },[catCols, sample]);
+  const counts = useMemo(()=>{
+    if(!catCol) return [];
+    const m=new Map<string,number>();
+    sample.forEach(r=>{ const k=String(r?.[catCol]??'—'); m.set(k,(m.get(k)||0)+1); });
+    return Array.from(m,([name,value])=>({name,value})).sort((a,b)=>b.value-a.value).slice(0,12);
+  },[sample,catCol]);
+
+  // Trend (first date+numeric)
+  const dateCol=dateCols[0], lineCol=numCols[0]||numCols[1];
+  const trend = useMemo(()=>{
+    if(!dateCol||!lineCol) return [];
+    const m=new Map<string,number>();
+    sample.forEach(r=>{
+      const raw=r?.[dateCol]; const d=(raw instanceof Date)?raw:new Date(raw);
+      if(isNaN(+d)) return; const key=`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-01`;
+      m.set(key,(m.get(key)||0)+(Number(r?.[lineCol])||0));
+    });
+    return Array.from(m,([date,value])=>({date,value})).sort((a,b)=>a.date.localeCompare(b.date));
+  },[sample,dateCol,lineCol]);
+
+  // Scatter (first two numerics)
+  const xCol=numCols[0], yCol=numCols[1];
+  const sc = useMemo(()=>{
+    if(!xCol||!yCol) return [];
+    return sample.slice(0,400).map(r=>({x:r?.[xCol], y:r?.[yCol]}))
+      .filter(d=> typeof d.x==='number' && typeof d.y==='number');
+  },[sample,xCol,yCol]);
+
+  const slice = useMemo(()=>{
+    const start=(page-1)*pageSize; return (rows||[]).slice(start, start+pageSize);
+  },[rows,page]);
+
+  return (
+    <div style={{display:'grid', gap:12}}>
+      <div style={{display:'grid', gap:12, gridTemplateColumns:'repeat(2, minmax(0,1fr))'}}>
+        <Chart title={histCol?`Distribution of ${histCol}`:'Distribution'}>
+          {hist.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={hist} margin={{top:8,right:12,left:0,bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="bin" tick={{fontSize:11}} /><YAxis width={40} />
+                <Tooltip /><Bar dataKey="count" fill={COLORS[0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : <EmptyMini text="No numeric column to plot."/>}
+        </Chart>
+
+        <Chart title={catCol?`Counts by ${catCol}`:'Counts by category'}>
+          {counts.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <PieChart><Tooltip />
+                <Pie data={counts} dataKey="value" nameKey="name" outerRadius={80}>
+                  {counts.map((_,i)=><Cell key={i} fill={COLORS[i%COLORS.length]} />)}
+                </Pie>
+              </PieChart>
+            </ResponsiveContainer>
+          ) : <EmptyMini text="No small-cardinality categorical column."/>}
+        </Chart>
+
+        <Chart title={dateCol&&lineCol?`Trend of ${lineCol} by ${dateCol}`:'Trend'}>
+          {trend.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <LineChart data={trend} margin={{top:8,right:12,left:0,bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" tick={{fontSize:11}} /><YAxis width={48} />
+                <Tooltip /><Line type="monotone" dataKey="value" stroke={COLORS[1]} dot={false}/>
+              </LineChart>
+            </ResponsiveContainer>
+          ) : <EmptyMini text="Need a date + numeric column."/>}
+        </Chart>
+
+        <Chart title={xCol&&yCol?`${yCol} vs ${xCol}`:'Scatter'}>
+          {sc.length ? (
+            <ResponsiveContainer width="100%" height={220}>
+              <ScatterChart margin={{top:8,right:12,left:0,bottom:0}}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="x" name={xCol} /><YAxis dataKey="y" name={yCol} />
+                <Tooltip /><Scatter data={sc} fill={COLORS[2]} />
+              </ScatterChart>
+            </ResponsiveContainer>
+          ) : <EmptyMini text="Need two numeric columns."/>}
+        </Chart>
+      </div>
+
+      <div className="card"><h2>Preview (15/pg)</h2>
+        <div className="body">
+          <div className="table-wrap">
+            <table className="table">
+              <thead><tr>{cols.map(c=><th key={c}>{c}</th>)}</tr></thead>
+              <tbody>
+                {slice.map((r,i)=><tr key={i}>{cols.map(c=><td key={c}>{fmt(r?.[c])}</td>)}</tr>)}
+                {!slice.length && <tr><td colSpan={cols.length||1} className="muted" style={{padding:16}}>No rows.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginTop:8}}>
+            <div className="muted">Page {page} / {totalPages} · showing {slice.length} of {rows?.length||0}</div>
+            <div style={{display:'flex',gap:6}}>
+              <button className="btn" onClick={()=>setPage(1)} disabled={page<=1}>&laquo; First</button>
+              <button className="btn" onClick={()=>setPage(p=>Math.max(1,p-1))} disabled={page<=1}>&lsaquo; Prev</button>
+              <button className="btn" onClick={()=>setPage(p=>Math.min(totalPages,p+1))} disabled={page>=totalPages}>Next &rsaquo;</button>
+              <button className="btn" onClick={()=>setPage(totalPages)} disabled={page>=totalPages}>Last &raquo;</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Chart({title, children}:{title:string; children:React.ReactNode}){
+  return <div className="card"><h2>{title}</h2><div className="body">{children}</div></div>;
+}
+function EmptyMini({text}:{text:string}){
+  return <div className="muted" style={{height:220,display:'grid',placeItems:'center'}}>{text}</div>;
+}
+function fmt(v:any){
+  if(v==null) return '—';
+  if(typeof v==='number') return Number.isInteger(v)? String(v) : v.toFixed(3);
+  if(typeof v==='string' && /^\d{4}-\d{2}-\d{2}T/.test(v)) return v.slice(0,10);
+  return String(v);
+}

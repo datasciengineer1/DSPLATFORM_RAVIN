@@ -1,0 +1,147 @@
+'use client';
+import React, { useEffect, useMemo, useState } from 'react';
+import DataTable from '../components/DataTable';
+import InsightBoard from '../components/InsightBoard';
+
+async function postJSON(path:string, body:any){
+  const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body??{})});
+  if(!r.ok) throw new Error(`POST ${path} ${r.status}`); return r.json();
+}
+function normalizeCM(cm:any): number[][]{
+  try{
+    if(Array.isArray(cm) && Array.isArray(cm[0]) && Array.isArray(cm[1])){
+      const tn=Number(cm[0][0]??0), fp=Number(cm[0][1]??0), fn=Number(cm[1][0]??0), tp=Number(cm[1][1]??0);
+      return [[tn,fp],[fn,tp]];
+    }
+  }catch{}
+  return [[0,0],[0,0]];
+}
+
+export default function Predictor({ rows, targetHint, question }:{ rows:any[]; targetHint?:string; question?:string }){
+  const [preds,setPreds]=useState<any[]>([]);
+  const [cm,setCm]=useState<number[][]>([[0,0],[0,0]]);
+  const [roc,setRoc]=useState<{fpr:number,tpr:number}[]>([]);
+  const [reasons,setReasons]=useState<any[]>([]);
+  const [metrics,setMetrics]=useState<{name:string,value:number}[]>([]);
+  const [summaryText,setSummaryText]=useState<string>('—');
+
+  const [whyText,setWhyText]=useState<string>(''); const [whyLoading,setWhyLoading]=useState(false);
+  const [moreText,setMoreText]=useState<string>(''); const [moreLoading,setMoreLoading]=useState(false); const [moreError,setMoreError]=useState('');
+  const [moreCards,setMoreCards]=useState<{title:string;items:string[]}[]>([]);
+  const [moreCharts,setMoreCharts]=useState<any>({});
+  const [insightsVersion,setInsightsVersion]=useState(0);
+
+  const cols = useMemo(()=>Object.keys(rows?.[0]||{}),[rows]);
+
+  // Predict & diagnostics whenever NLQ rows change
+  useEffect(()=>{(async()=>{
+    setMoreText(''); setMoreError(''); setMoreCards([]); setMoreCharts({}); setWhyText('');
+    if(!rows?.length){ setPreds([]); setSummaryText('—');
+    try{window.dispatchEvent(new CustomEvent('explain:update',{detail:{mode:'summary',text:'—'}}));}catch{}; setCm([[0,0],[0,0]]); setRoc([]); setReasons([]); return; }
+
+    const resp = await fetch('/api/predict',{ method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({rows: rows.slice(0,200)}) })
+      .then(x=>x.ok?x.json():{rows:[],cm:[[0,0],[0,0]],roc:[],reasons:[]})
+      .catch(()=>({rows:[],cm:[[0,0],[0,0]],roc:[],reasons:[]}));
+
+    const predsRows = Array.isArray(resp.rows)?resp.rows:[];
+    setPreds(predsRows);
+    const cmN = normalizeCM(resp.cm);
+    setCm(cmN);
+    const rocN = Array.isArray(resp.roc)?resp.roc:[];
+    setRoc(rocN);
+    const provided = Array.isArray(resp.reasons)?resp.reasons:[];
+    const filtered = provided.filter((r:any)=> r && cols.includes(r.feature));
+    setReasons(filtered);
+    (window as any).__reasons__ = filtered;
+
+    const m = (window as any).__train_metrics__ || {};
+    const mx = Object.entries(m).map(([name,value])=>({name, value:Number(value)}));
+    setMetrics(mx);
+
+    // Summary bullets
+    const top = filtered.slice(0,5).map((x:any)=>`• ${x.feature}: ${x.direction} (${Math.round((x.impact??x.importance)*100)}% impact)`).join('\n');
+    const lines = [
+      `• Target: ${targetHint ?? '—'}`,
+      mx.length? `• Metrics: ${mx.map(m=>`${m.name}=${(m.value as number).toFixed(3)}`).join(', ')}` : '• Metrics: n/a',
+      '• Key drivers:',
+      top || '• (drivers unavailable for this dataset/run)',
+      '• Action: review high-impact cohorts with owners.'
+    ];
+    setSummaryText(lines.join('\n'));
+
+    // Emit diagnostics to right panel
+    const ps = predsRows.map(p=>Number(p._prob)).filter(n=>Number.isFinite(n));
+    const bins = Array.from({length:10},()=>0); ps.forEach(p=>{ const i=Math.min(9,Math.floor(p*10)); bins[i]++; });
+    const probHist = bins.map((c,i)=>({x:`${i/10}-${(i+1)/10}`, v:c}));
+    const diag = { cm: cmN, roc: rocN, probHist, reasons: filtered, metrics: mx };
+    (window as any).__last_diag__ = diag;
+    window.dispatchEvent(new CustomEvent('diag:update',{detail:diag}));
+
+    // Concise reasoning
+    setWhyLoading(true);
+    postJSON('/api/explain/llm',{ mode:'reasons', columns: cols, metrics: mx })
+      .then(j=>setWhyText(j?.text||'')) .catch(()=>setWhyText(''))
+      .finally(()=>setWhyLoading(false));
+  })()},[rows, targetHint, cols.join('|')]);
+
+  // Auto-refresh insights when NLQ rows/question change
+  useEffect(()=>{ void generateMore(true); }, [rows, question, cols.join('|')]);
+
+  async function generateMore(auto=false){
+    setMoreLoading(true); if(!auto) setMoreError('');
+    try{
+      const j = await postJSON('/api/explain/llm', {
+        mode:'more', question, columns: cols, metrics, sample: rows.slice(0,200)
+      });
+      setMoreText(j?.text || '');
+      setMoreCards(Array.isArray(j?.cards)? j.cards : []);
+      setMoreCharts(j?.charts || {});
+      setInsightsVersion(v=>v+1);
+    }catch(e:any){
+      if(!auto){ setMoreError(`Could not generate insights (${e?.message||'unknown error'}).`); }
+      setMoreCards([]); setMoreCharts({});
+    }finally{ setMoreLoading(false); }
+  }
+
+  return (
+    <div style={{display:'grid',gap:12}}>
+      {/* 1) Put Summary & Insights at the top */}
+      <div className="card"><h2>Summary (bulleted)</h2><div className="body">
+        <pre className="explain-box" style={{margin:0}}>{summaryText}</pre>
+      </div></div>
+
+      <div className="card" key={`ins-${insightsVersion}`}><h2>Additional insights</h2>
+        <div className="body" style={{display:'grid',gap:12}}>
+          <div style={{display:'flex',gap:8}}>
+            <button className="btn" onClick={()=>generateMore(false)} disabled={moreLoading}>{moreLoading?'Generating…':'Generate more insights'}</button>
+            {moreError && <div className="muted" style={{color:'#b91c1c'}}>{moreError}</div>}
+          </div>
+          {moreText && <pre className="explain-box" style={{whiteSpace:'pre-wrap',margin:0}}>{moreText}</pre>}
+          {moreCards?.length>0 && (
+            <div className="scroll-x" style={{maxHeight:220}}>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(260px,1fr))',gap:12}}>
+                {moreCards.map((c,i)=>(
+                  <div className="card" key={i}><h2>{c.title}</h2><div className="body">
+                    <ul className="muted">{c.items.map((it,j)=><li key={j}>{it}</li>)}</ul>
+                  </div></div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 2) NLQ results table next */}
+      {rows?.length
+        ? <div className="scroll-x"><DataTable rows={preds.length?preds:rows} pageSize={15}/></div>
+        : <div className="card"><h2>No NLQ result yet</h2><div className="body"><div className="muted">Ask a question to generate results and predictions.</div></div></div>
+      }
+
+      {/* 3) Reasoning at the end */}
+      <div className="card"><h2>Reasoning (concise)</h2><div className="body">
+        {whyLoading ? <div className="loading"><span className="spinner"></span><span>Explaining steps…</span></div>
+                    : <pre className="explain-box" style={{margin:0,whiteSpace:'pre-wrap'}}>{whyText || '—'}</pre>}
+      </div></div>
+    </div>
+  );
+}

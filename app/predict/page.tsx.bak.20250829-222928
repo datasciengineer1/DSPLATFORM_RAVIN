@@ -1,0 +1,458 @@
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { useSearchParams } from "next/navigation";
+import {
+  ResponsiveContainer,
+  LineChart, Line,
+  AreaChart, Area,
+  BarChart, Bar,
+  CartesianGrid, XAxis, YAxis, Tooltip, Legend, Brush, ReferenceLine
+} from "recharts";
+
+/* ------------------------------ utilities ------------------------------ */
+const fmt = (n: any, d = 0) =>
+  typeof n === "number" && Number.isFinite(n) ? n.toLocaleString(undefined, { maximumFractionDigits: d }) : "—";
+const pct = (x: number) => `${(x * 100).toFixed(1)}%`;
+
+function isIsoDate(s: string) { return /^\d{4}-\d{2}(-\d{2})?$/.test(s); }
+function monthKey(s: string) { return s.slice(0, 7); }            // YYYY-MM
+function quarterKey(s: string) {                                   // YYYY-Q#
+  const [y, m] = s.split("-").map(Number);
+  if (!y || !m) return s;
+  const q = Math.floor((m - 1) / 3) + 1;
+  return `${y}-Q${q}`;
+}
+function stdev(arr: number[]) {
+  const a = arr.filter(Number.isFinite);
+  if (a.length < 2) return 0;
+  const mean = a.reduce((s, v) => s + v, 0) / a.length;
+  const v = a.reduce((s, v) => s + (v - mean) ** 2, 0) / (a.length - 1);
+  return Math.sqrt(Math.max(v, 0));
+}
+
+function decimate<T>(arr: T[], maxPoints = 600) {
+  if (arr.length <= maxPoints) return arr;
+  const step = Math.ceil(arr.length / maxPoints);
+  const out: T[] = [];
+  for (let i = 0; i < arr.length; i += step) out.push(arr[i]);
+  // always include the last point
+  if (out[out.length - 1] !== arr[arr.length - 1]) out.push(arr[arr.length - 1]);
+  return out;
+}
+
+type SeriesPayload = {
+  labels: string[];
+  actual: Array<number | null>;
+  forecast: Array<number | null>;
+};
+
+function bucketSeries(series: SeriesPayload, mode: "auto" | "month" | "quarter") {
+  const { labels, actual, forecast } = series;
+  const hasDates = labels.some(isIsoDate);
+  if (!hasDates || mode === "auto") {
+    // auto: if > 1200 points and looks like dates, bucket by month; else just decimate
+    if (labels.length > 1200 && hasDates) return bucketSeries(series, "month");
+    return {
+      labels: decimate(labels),
+      actual: decimate(actual),
+      forecast: decimate(forecast),
+    };
+  }
+
+  const keyFn = mode === "quarter" ? quarterKey : monthKey;
+  const agg: Record<string, { a: number; an: number; f: number; fn: number }> = {};
+  for (let i = 0; i < labels.length; i++) {
+    const k = keyFn(labels[i]);
+    if (!agg[k]) agg[k] = { a: 0, an: 0, f: 0, fn: 0 };
+    const av = actual[i]; if (Number.isFinite(av)) { agg[k].a += av as number; agg[k].an++; }
+    const fv = forecast[i]; if (Number.isFinite(fv)) { agg[k].f += fv as number; agg[k].fn++; }
+  }
+  const keys = Object.keys(agg).sort();
+  return {
+    labels: keys,
+    actual: keys.map(k => (agg[k].an ? agg[k].a / agg[k].an : null)),
+    forecast: keys.map(k => (agg[k].fn ? agg[k].f / agg[k].fn : null)),
+  };
+}
+
+function residuals(actual: (number | null)[], forecast: (number | null)[]) {
+  const r: number[] = [];
+  const n = Math.max(actual.length, forecast.length);
+  for (let i = 0; i < n; i++) {
+    const a = actual[i], f = forecast[i];
+    if (Number.isFinite(a) && Number.isFinite(f)) r.push((a as number) - (f as number));
+  }
+  return r;
+}
+function hist(arr: number[], bins = 20) {
+  if (!arr.length) return [];
+  const lo = Math.min(...arr), hi = Math.max(...arr);
+  if (lo === hi) return [{ name: fmt(lo, 2), value: arr.length }];
+  const step = (hi - lo) / bins;
+  const out = Array.from({ length: bins }, (_, i) => ({ name: (lo + i * step), value: 0 }));
+  for (const v of arr) {
+    const idx = Math.min(bins - 1, Math.max(0, Math.floor((v - lo) / step)));
+    out[idx].value++;
+  }
+  return out.map((b, i) => ({ name: (lo + i * step).toFixed(1), value: b.value }));
+}
+
+async function postJSON(path: string, body: any) {
+  const res = await fetch(path, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+/* ------------------------------ page ------------------------------ */
+export default function PredictPage() {
+  const sp = useSearchParams();
+  const [datasetId, setDatasetId] = useState<string | null>(null);
+  const [datasetName, setDatasetName] = useState<string | null>(null);
+  const [question, setQuestion] = useState("What is the sales forecast for next 2 quarters based on last 2 years of data?");
+  const [result, setResult] = useState<any>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // viz controls
+  const [granularity, setGranularity] = useState<"auto" | "month" | "quarter">("auto");
+  const [showPI, setShowPI] = useState(true);
+
+  useEffect(() => {
+    const id = sp.get("dataset") || sp.get("id") || sessionStorage.getItem("currentDatasetId") || "demo";
+    const name = sessionStorage.getItem("currentDatasetName") || null;
+    setDatasetId(id); setDatasetName(name);
+  }, [sp]);
+
+  async function run() {
+    if (!datasetId) return;
+    try {
+      setLoading(true); setError(null);
+      const r = await postJSON("/api/predict/run", { id: datasetId, question });
+      setResult(r);
+    } catch (e: any) {
+      setError(e?.message ?? "Prediction failed");
+      setResult(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+  useEffect(() => { if (datasetId) run(); /* auto-run */ }, [datasetId]);
+
+  /* ------------------------------ derived ------------------------------ */
+  const series = useMemo(() => {
+    const s = result?.series as SeriesPayload | undefined;
+    if (!s?.labels?.length) return null;
+    const bucketed = bucketSeries(s, granularity);
+    const mae = Number(result?.metrics?.mae);
+    const rmse = Number(result?.metrics?.rmse);
+    const band = Number.isFinite(mae) ? mae : (Number.isFinite(rmse) ? rmse : 0);
+    const rows = bucketed.labels.map((x, i) => ({
+      x,
+      actual: bucketed.actual[i],
+      forecast: bucketed.forecast[i],
+      lo: showPI && Number.isFinite(bucketed.forecast[i] as number) ? (bucketed.forecast[i] as number) - 1.96 * band : null,
+      hi: showPI && Number.isFinite(bucketed.forecast[i] as number) ? (bucketed.forecast[i] as number) + 1.96 * band : null,
+    }));
+    return { rows, mae, rmse, labels: bucketed.labels, actual: bucketed.actual, forecast: bucketed.forecast };
+  }, [result, granularity, showPI]);
+
+  const resid = useMemo(() => {
+    if (!result?.series) return { arr: [], hist: [] as any[] };
+    const r = residuals(result.series.actual, result.series.forecast);
+    return { arr: r, hist: hist(r, 24) };
+  }, [result]);
+
+  const seasonalityByMonth = useMemo(() => {
+    const s = result?.series as SeriesPayload | undefined;
+    if (!s?.labels?.length) return [];
+    const by: Record<string, { s: number; n: number }> = {};
+    for (let i = 0; i < s.labels.length; i++) {
+      const lab = s.labels[i];
+      const a = s.actual[i];
+      if (!isIsoDate(lab) || !Number.isFinite(a)) continue;
+      const m = Number(lab.slice(5, 7)); // 01..12
+      const k = String(m);
+      if (!by[k]) by[k] = { s: 0, n: 0 };
+      by[k].s += a as number; by[k].n++;
+    }
+    const rows = Array.from({ length: 12 }, (_, i) => {
+      const k = String(i + 1);
+      const v = by[k];
+      return { name: `${i + 1}`, value: v?.n ? v.s / v.n : 0 };
+    });
+    return rows;
+  }, [result]);
+
+  /* ------------------------------ readable explainability ------------------------------ */
+  const explainBullets = useMemo(() => {
+    const intent = result?.intent || "forecast";
+    const target = result?.target || "target";
+    const model = result?.modelName || "Moving average";
+    const mae = result?.metrics?.mae ?? null;
+    const rmse = result?.metrics?.rmse ?? null;
+
+    if (intent !== "forecast") {
+      // drivers/impact
+      const imp = (result?.importances || []).slice(0, 5);
+      const topSeg = (result?.groupRates || []).slice(0, 3);
+      return [
+        `You asked for drivers/impact on **${target}**.`,
+        `We looked across ${fmt(result?.importances?.length || 0)} numeric features and ${fmt(result?.groupRates?.length || 0)} segments.`,
+        imp.length
+          ? `Strongest numeric associations: ${imp.map((d: any) =>
+              `**${d.feature}** (${d.sign >= 0 ? "+" : "−"}${(d.score * 100).toFixed(0)}%)`).join(", ")}.`
+          : `We didn’t find strong numeric drivers using simple correlations.`,
+        topSeg.length
+          ? `Top segments by average **${target}**: ${topSeg.map((g: any) =>
+              `**${g.group}** (${fmt(g.rate, 2)})`).join(", ")}.`
+          : `No clear segment differences stood out.`,
+        `Tip: move to **Model** to quantify uplift (e.g., regression with controls) or to simulate counterfactuals.`
+      ];
+    }
+
+    // forecast
+    const a = series?.actual?.filter(Number.isFinite) as number[] | undefined;
+    const f = series?.forecast?.filter(Number.isFinite) as number[] | undefined;
+    const last = a && a[a.length - 1];
+    const first = a && a[0];
+    const slope = a && a.length >= 2 ? (a[a.length - 1] - a[0]) / Math.max(1, a.length - 1) : 0;
+    const vol = a ? stdev(a) : 0;
+
+    return [
+      `You asked for a forecast of **${target}**.`,
+      `We used **${model}** on ${fmt(result?.series?.labels?.length || 0)} timeline points.`,
+      `Recent behavior: ${first != null && last != null ? (last > first ? "upward" : last < first ? "downward" : "flat") : "—"} trend; avg step ≈ **${fmt(slope, 2)}**; volatility (st.dev) ≈ **${fmt(vol, 2)}**.`,
+      (Number.isFinite(rmse) || Number.isFinite(mae))
+        ? `Typical error: **RMSE ${fmt(rmse, 2)}**, **MAE ${fmt(mae, 2)}** (smaller is better).`
+        : `Model quality metrics were not available.`,
+      showPI
+        ? `Shaded band shows an approximate **95% prediction interval** around the forecast (±1.96×error).`
+        : `You can toggle on the 95% prediction band for uncertainty.`,
+      `Next: add drivers in **Model** (e.g., promotions/price) to improve accuracy; or add calendar features in **Engineering** to capture seasonality.`
+    ];
+  }, [result, series, showPI]);
+
+  /* ------------------------------ UI ------------------------------ */
+  const steps = [
+    { label: "1. Data", href: "/data" },
+    { label: "2. EDA", href: "/workspace" },
+    { label: "3. Engineering", href: "/engineering" },
+    { label: "4. NLQ", href: "/nlq" },
+    { label: "5. Model", href: "/model" },
+    { label: "6. Predict", href: "/predict" },
+  ];
+
+  const recommend = [
+    `Is there seasonality in ${result?.target || "Sales"}?`,
+    `What changed last month that impacted ${result?.target || "Sales"}?`,
+    `Top 3 cities driving ${result?.target || "Sales"} recently.`,
+  ];
+
+  return (
+    <main className="container mx-auto px-4 py-4">
+      {/* breadcrumb / steps */}
+      <div className="mb-3 flex flex-wrap gap-2">
+        {steps.map((s, i) => (
+          <Link key={s.label} href={s.href}
+            className={`px-3 py-1.5 rounded-full border text-sm ${i===5 ? "bg-blue-600 text-white border-blue-600":"bg-white dark:bg-zinc-900 border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300"}`}>
+            {s.label}
+          </Link>
+        ))}
+      </div>
+
+      {/* question + chips */}
+      <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-3 mb-3">
+        <div className="text-xs text-zinc-500 mb-1">Dataset: {datasetName ?? (datasetId ? `#${datasetId}` : "(none)")}</div>
+        <div className="flex gap-2">
+          <input
+            className="flex-1 border rounded-lg px-3 py-2 bg-white dark:bg-zinc-900"
+            value={question} onChange={e=>setQuestion(e.target.value)}
+            placeholder="Ask a question (forecast, drivers, compare)…"
+          />
+          <button onClick={run} className="px-3 py-2 rounded-lg bg-blue-600 text-white">Run</button>
+        </div>
+        <div className="mt-2 flex flex-wrap gap-2">
+          {recommend.map((q, i) => (
+            <button key={i} onClick={()=>setQuestion(q)}
+              className="text-xs rounded-full border px-2 py-1 hover:bg-zinc-50 dark:hover:bg-zinc-900">
+              {q}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* forecast or drivers */}
+      {result?.intent === "impact" ? (
+        <div className="grid grid-cols-12 gap-4">
+          <div className="col-span-12 xl:col-span-8 space-y-4">
+            {/* segment bars */}
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Segment averages of {result?.target}</div>
+              <div className="h-64">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={(result?.groupRates || []).slice(0, 12)}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="group" />
+                    <YAxis />
+                    <Tooltip />
+                    <Bar dataKey="rate" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
+          <div className="col-span-12 xl:col-span-4">
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Explainability</div>
+              <ul className="text-sm space-y-2 leading-relaxed">
+                {explainBullets.map((t, i)=><li key={i} dangerouslySetInnerHTML={{__html: t}} />)}
+              </ul>
+            </div>
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4 mt-4">
+              <div className="text-lg font-semibold mb-2">Top drivers</div>
+              <div className="h-52">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={(result?.importances || []).slice(0, 8)}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="feature" />
+                    <YAxis />
+                    <Tooltip />
+                    <Bar dataKey="score" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : (
+        <div className="grid grid-cols-12 gap-4">
+          {/* LEFT: charts */}
+          <div className="col-span-12 xl:col-span-8 space-y-4">
+            {/* controls */}
+            <div className="flex items-center gap-3 text-sm">
+              <label className="flex items-center gap-2">
+                Granularity:
+                <select className="border rounded px-2 py-1"
+                  value={granularity} onChange={e=>setGranularity(e.target.value as any)}>
+                  <option value="auto">auto</option>
+                  <option value="month">month</option>
+                  <option value="quarter">quarter</option>
+                </select>
+              </label>
+              <label className="flex items-center gap-2">
+                <input type="checkbox" checked={showPI} onChange={e=>setShowPI(e.target.checked)} />
+                Show 95% prediction band
+              </label>
+              {loading && <span className="text-zinc-500">Running…</span>}
+              {error && <span className="text-red-600">{error}</span>}
+            </div>
+
+            {/* main forecast chart */}
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Forecast of {result?.target || "target"}</div>
+              <div className="h-[420px]">
+                <ResponsiveContainer width="100%" height="100%">
+                  <LineChart data={series?.rows || []}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="x" />
+                    <YAxis />
+                    <Tooltip />
+                    <Legend />
+                    {showPI && (
+                      <Area
+                        type="monotone"
+                        dataKey="hi"
+                        strokeOpacity={0}
+                        fillOpacity={0.10}
+                        isAnimationActive={false}
+                        activeDot={false}
+                        dot={false}
+                      />
+                    )}
+                    {showPI && (
+                      <Area
+                        type="monotone"
+                        dataKey="lo"
+                        strokeOpacity={0}
+                        fillOpacity={0.10}
+                        isAnimationActive={false}
+                        activeDot={false}
+                        dot={false}
+                      />
+                    )}
+                    <Line type="monotone" dataKey="actual" name="actual" dot={false} />
+                    <Line type="monotone" dataKey="forecast" name="forecast" dot={false} />
+                    <Brush height={24} travellerWidth={8} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="grid grid-cols-3 gap-3 mt-3 text-sm">
+                <div className="rounded-xl border px-3 py-2">
+                  <div className="text-xs text-zinc-500">MODEL</div>
+                  <div className="font-medium">{result?.modelName || "Moving average"}</div>
+                </div>
+                <div className="rounded-xl border px-3 py-2">
+                  <div className="text-xs text-zinc-500">RMSE</div>
+                  <div className="font-medium">{fmt(series?.rmse, 2)}</div>
+                </div>
+                <div className="rounded-xl border px-3 py-2">
+                  <div className="text-xs text-zinc-500">MAE</div>
+                  <div className="font-medium">{fmt(series?.mae, 2)}</div>
+                </div>
+              </div>
+            </div>
+
+            {/* residuals histogram */}
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Residuals</div>
+              <div className="h-48">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={resid.hist}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="name" />
+                    <YAxis />
+                    <Tooltip />
+                    <Bar dataKey="value" />
+                    <ReferenceLine y={0} stroke="#999" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+              <div className="text-xs text-zinc-500 mt-1">
+                Residuals close to 0 and roughly symmetric are a good sign. Big tails mean under/over-fit.
+              </div>
+            </div>
+
+            {/* month-of-year seasonality */}
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Seasonality (avg by month)</div>
+              <div className="h-48">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={seasonalityByMonth}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="name" />
+                    <YAxis />
+                    <Tooltip />
+                    <Bar dataKey="value" />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT: explainability */}
+          <div className="col-span-12 xl:col-span-4">
+            <div className="bg-white dark:bg-zinc-900 rounded-2xl border border-zinc-100 dark:border-zinc-800 p-4">
+              <div className="text-lg font-semibold mb-2">Explainability</div>
+              <ul className="text-sm space-y-2 leading-relaxed">
+                {explainBullets.map((t, i)=><li key={i} dangerouslySetInnerHTML={{__html: t}} />)}
+              </ul>
+            </div>
+          </div>
+        </div>
+      )}
+    </main>
+  );
+}

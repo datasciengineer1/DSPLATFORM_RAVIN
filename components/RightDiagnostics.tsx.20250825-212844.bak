@@ -1,0 +1,88 @@
+'use client';
+import React, {useEffect, useState} from 'react';
+
+function Card({title,children,caption}:{title:string;children:React.ReactNode;caption?:string}){
+  return <div className="card" style={{marginBottom:12}}>
+    <h2>{title}</h2>
+    <div className="body">{children}{caption && <div className="chart-caption">{caption}</div>}</div>
+  </div>;
+}
+function ConfusionMatrix({cm}:{cm:number[][]}){
+  const tn=cm?.[0]?.[0]||0, fp=cm?.[0]?.[1]||0, fn=cm?.[1]?.[0]||0, tp=cm?.[1]?.[1]||0;
+  const cells=[{v:tn,l:'TN'},{v:fp,l:'FP'},{v:fn,l:'FN'},{v:tp,l:'TP'}], max=Math.max(...cells.map(c=>c.v),1);
+  return <Card title="Confusion Matrix" caption="Diagonal = correct predictions.">
+    <svg viewBox="0 0 200 200" style={{border:'1px solid #0002',borderRadius:8}}>
+      {cells.map((c,i)=>{const x=(i%2)*100,y=Math.floor(i/2)*100,a=0.15+0.7*(c.v/max);
+        return <g key={i}><rect x={x} y={y} width={100} height={100} fill={`rgba(37,99,235,${a})`}/>
+        <text x={x+50} y={y+45} textAnchor="middle" fontSize="16" fill="#fff">{c.l}</text>
+        <text x={x+50} y={y+70} textAnchor="middle" fontSize="14" fill="#fff">{c.v}</text></g>;})}
+    </svg>
+  </Card>;
+}
+function ROC({roc}:{roc:{fpr:number,tpr:number}[]}) {
+  if(!roc?.length) return <Card title="ROC"><div className="muted">—</div></Card>;
+  const pts = roc.map(p=>`${(p.fpr||0)*180+10},${190-((p.tpr||0)*180)}`).join(' ');
+  return <Card title="ROC">
+    <svg viewBox="0 0 200 200" style={{border:'1px solid #0002',borderRadius:8}}>
+      <line x1="10" y1="190" x2="190" y2="10" stroke="#aaa" strokeDasharray="4 4"/>
+      <polyline points={pts} fill="none" stroke="#2563eb" strokeWidth="2"/>
+      <rect x="10" y="10" width="180" height="180" fill="none" stroke="#0002"/>
+    </svg>
+  </Card>;
+}
+function ProbHist({data}:{data:{x:string,v:number}[]}) {
+  if(!data?.length) return <Card title="Predicted probability distribution"><div className="muted">—</div></Card>;
+  const w=240,h=160,p=24,maxY=Math.max(...data.map(d=>d.v),1),bw=(w-2*p)/data.length;
+  return <Card title="Predicted probability distribution" >
+    <svg viewBox={`0 0 ${w} ${h}`}>
+      {data.map((d,i)=>{const x=p+i*bw,y=h-p-(d.v/maxY)*(h-2*p);
+        return <rect key={i} x={x} y={y} width={Math.max(1,bw-2)} height={h-p-y} fill="rgba(37,99,235,0.75)"/>})}
+      <text x={w/2} y={h-6} textAnchor="middle" fontSize="10" fill="#555">p(y=1)</text>
+      <text x={6} y={12} fontSize="10" fill="#555">count</text>
+    </svg>
+  </Card>;
+}
+function Drivers({items}:{items:{feature:string;direction:string;impact?:number;importance?:number}[]}) {
+  return <Card title="Top drivers">
+    {items?.length
+      ? <ul className="muted">{items.map((r,i)=><li key={i}><strong>{r.feature}</strong> {r.direction} · impact {Math.round(((r.impact??r.importance)||0)*100)}%</li>)}</ul>
+      : <div className="muted">—</div>}
+  </Card>;
+}
+function Metrics({metrics}:{metrics:{name:string,value:number}[]}) {
+  return <Card title="Training metrics">
+    {metrics?.length
+      ? <ul className="muted">{metrics.map(m=><li key={m.name}><strong>{m.name}</strong>: {Number(m.value).toFixed(3)}</li>)}</ul>
+      : <div className="muted">—</div>}
+  </Card>;
+}
+
+export default function RightDiagnostics(){
+  const [cm,setCm]=useState<number[][]>([[0,0],[0,0]]);
+  const [roc,setRoc]=useState<{fpr:number,tpr:number}[]>([]);
+  const [hist,setHist]=useState<{x:string,v:number}[]>([]);
+  const [drivers,setDrivers]=useState<any[]>([]);
+  const [metrics,setMetrics]=useState<{name:string,value:number}[]>([]);
+
+  useEffect(()=>{
+    const seed = (window as any).__last_diag__;
+    if(seed){ setCm(seed.cm||[[0,0],[0,0]]); setRoc(seed.roc||[]); setHist(seed.probHist||[]); setDrivers(seed.reasons||[]); setMetrics(seed.metrics||[]); }
+    const onUpdate = (e:any)=>{
+      const d=e?.detail||{};
+      setCm(d.cm||[[0,0],[0,0]]); setRoc(d.roc||[]); setHist(d.probHist||[]);
+      setDrivers(d.reasons||[]); setMetrics(d.metrics||[]);
+    };
+    window.addEventListener('diag:update', onUpdate);
+    return ()=> window.removeEventListener('diag:update', onUpdate);
+  },[]);
+
+  return (
+    <div style={{display:'grid',gap:12}}>
+      <ConfusionMatrix cm={cm}/>
+      <ROC roc={roc}/>
+      <ProbHist data={hist}/>
+      <Drivers items={drivers}/>
+      <Metrics metrics={metrics}/>
+    </div>
+  );
+}

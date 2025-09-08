@@ -1,0 +1,239 @@
+"use client";
+
+import React, { useEffect, useMemo, useState } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+
+async function fetchJSON(path: string) {
+  const res = await fetch(path, { cache: "no-store" });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+async function postJSON(path: string, body: any) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json(); // API returns {error} on user issues (200 OK)
+}
+
+type Summary = {
+  numericColumns?: string[];
+  categoricalColumns?: string[];
+  timeColumns?: string[];
+};
+
+function parseToken(q: string, key: string): string | null {
+  const re = new RegExp("\\[" + key + "=(.+?)\\]", "i");
+  const m = q.match(re);
+  return m ? m[1].trim() : null;
+}
+function stripTokens(q: string) { return q.replace(/\[[^\]]+\]/g, "").trim(); }
+function parseHorizon(q: string): number | null {
+  const m = q.match(/\bnext\s+(\d+)\s*(days?|weeks?|months?|quarters?)\b/i);
+  return m ? Number(m[1]) : null;
+}
+
+/** Robust target guesser: works even if we can't read columns yet. */
+function guessTarget(question: string, numericCols: string[] = []): string | null {
+  const q = question.toLowerCase();
+  const colsLC = (numericCols || []).map(c => c.toLowerCase());
+  const has = (name: string) => colsLC.includes(name.toLowerCase());
+  const getIfHas = (...names: string[]) => names.find(n => has(n)) || null;
+  const findRe = (re: RegExp) => {
+    const i = colsLC.findIndex(c => re.test(c));
+    return i >= 0 ? numericCols[i] : null;
+  };
+
+  // Survival / classification phrasing
+  if (/surviv(al|e|ed)|survival rate|died|death/i.test(q)) {
+    return getIfHas("Survived") || findRe(/surviv|died|death|alive/) || "Survived";
+  }
+
+  // Sales / revenue
+  if (/revenue|sales?\b|turnover|gmv/i.test(q)) {
+    return getIfHas("Revenue","Sales","Sale") || findRe(/revenue|sales?/) || "Revenue";
+  }
+
+  // Profit / margins
+  if (/profit|margin/i.test(q)) {
+    return getIfHas("Profit","GrossProfit","Margin") || findRe(/profit|margin/) || "Profit";
+  }
+
+  // COGS / cost
+  if (/cogs|cost of goods|cost\b/i.test(q)) {
+    return getIfHas("COGS","Cost","CostOfGoods") || findRe(/cogs|cost/) || "COGS";
+  }
+
+  // Generic forecast with horizon → any numeric col, else a safe default
+  if (/forecast|next\s+\d+\s*(days?|weeks?|months?|quarters?)/i.test(q)) {
+    if (numericCols?.length) return numericCols[0];
+    return "Revenue";  // safe default so we never return null
+  }
+
+  // Last resort: first numeric col if known
+  return numericCols[0] || null;
+}
+
+/** Guess task if user didn't include [task=...] */
+function guessTask(question: string): "forecast"|"classification"|null {
+  const q = question.toLowerCase();
+  if (/forecast|predict next|next\s+\d+\s*(days?|weeks?|months?|quarters?)/i.test(q)) return "forecast";
+  if (/surviv(al|e|ed)|probabilit(y|ies)|rate\b/i.test(q)) return "classification";
+  return null;
+}
+
+export default function PredictPage() {
+  const sp = useSearchParams();
+  const router = useRouter();
+  const datasetId = sp.get("dataset") ?? sp.get("id") ?? "";
+  const qFromUrl = sp.get("q") ?? "";
+
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [question, setQuestion] = useState(qFromUrl || "");
+  const [running, setRunning] = useState(false);
+  const [result, setResult] = useState<any>(null);
+
+  // Load summary for dataset (used for numericColumns)
+  useEffect(() => {
+    let ignore = false;
+    (async () => {
+      if (!datasetId) return;
+      setResult(null);
+      try {
+        const s = await fetchJSON(`/api/eds/summary/${encodeURIComponent(datasetId)}`);
+        if (!ignore) setSummary(s);
+      } catch { if (!ignore) setSummary({}); }
+    })();
+    return () => { ignore = true };
+  }, [datasetId]);
+
+  // Suggested target from data alone
+  const targetFromData = useMemo(() => {
+    const nums = summary?.numericColumns ?? [];
+    for (const cand of ["Survived","Revenue","Sales","Sale","Target","y","value"]) {
+      if (nums.includes(cand)) return cand;
+    }
+    return nums[0] || null;
+  }, [summary]);
+
+  // Live best target for UI (tokens → question → data)
+  const tokenTarget = parseToken(question, "target");
+  const liveTarget = useMemo(() => {
+    return tokenTarget
+        || guessTarget(question, summary?.numericColumns ?? [])
+        || targetFromData
+        || null;
+  }, [tokenTarget, question, summary, targetFromData]);
+
+  // Recommendations reflect the live target
+  const recs = useMemo(() => {
+    const t = liveTarget ?? "Revenue";
+    return [
+      `What are top 5 drivers of [target=${t}]?`,
+      `Forecast next 6 months of [target=${t}]`,
+      `Show partial dependence of the most important feature on [target=${t}]`,
+      `Optimize classification threshold for [target=${t}] (if applicable)`,
+    ];
+  }, [liveTarget]);
+
+  function setRec(q: string) {
+    setQuestion(q);
+    const p = new URLSearchParams(Array.from(sp.entries()));
+    p.set("q", q);
+    if (datasetId) p.set("dataset", datasetId);
+    router.replace(`/predict?${p.toString()}`);
+  }
+
+  async function run() {
+    if (!datasetId) return;
+    setRunning(true);
+    setResult(null);
+
+    const tokenTask = (parseToken(question, "task") || "").toLowerCase() || null;
+    const taskHint = tokenTask || guessTask(question);
+    const horizon  = parseHorizon(question);
+    const qNoTokens = stripTokens(question);
+
+    const body = {
+      datasetId,
+      question: qNoTokens,
+      target: liveTarget,      // <- ensure a target is sent
+      taskHint,                // <- hint for backend
+      horizon,
+    };
+
+    const r = await postJSON("/api/predict/run", body);
+    setResult(r);
+    setRunning(false);
+  }
+
+  return (
+    <main key={datasetId} className="container mx-auto px-4 py-6">
+      <div className="grid grid-cols-12 gap-4">
+        {/* Left */}
+        <section className="col-span-12 md:col-span-4 space-y-4">
+          <div className="rounded-xl border p-4">
+            <div className="font-semibold mb-2">Recommended</div>
+            <div className="flex flex-col gap-2">
+              {recs.map((r, i) => (
+                <button key={i} onClick={() => setRec(r)} className="text-left border rounded-lg px-3 py-2 hover:bg-zinc-50">
+                  {r}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="rounded-xl border p-4 text-sm">
+            <div className="font-semibold mb-2">Dataset</div>
+            <div className="text-zinc-500">ID:</div>
+            <div className="font-mono">{datasetId || "—"}</div>
+          </div>
+        </section>
+
+        {/* Center */}
+        <section className="col-span-12 md:col-span-5 space-y-4">
+          <div className="rounded-xl border p-4">
+            <div className="font-semibold mb-2">Ask a question</div>
+            <div className="text-xs text-zinc-500 mb-2">Examples: forecasting, regression, classification.</div>
+            <div className="flex gap-2">
+              <input
+                className="flex-1 border rounded-lg px-3 py-2"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                placeholder={`e.g., Which features most increase odds of [target=${liveTarget ?? "Survived"}]?`}
+              />
+              <button onClick={run} disabled={running || !datasetId} className="px-3 py-2 rounded-lg bg-blue-600 text-white">
+                {running ? "Running…" : "Run"}
+              </button>
+            </div>
+          </div>
+
+          <div className="rounded-xl border p-4">
+            <div className="font-semibold mb-2">{result?.labels?.title || "Results"}</div>
+            <div className="min-h-[220px] border border-dashed rounded-lg flex items-center justify-center">
+              {!result && <div className="text-zinc-400">No results yet</div>}
+              {result?.error && <div className="text-red-600 text-sm">{result.error}</div>}
+              {result?.series?.length > 0 && <div className="text-sm text-zinc-600">{result.series.length} series returned.</div>}
+            </div>
+            <div className="text-xs text-zinc-500 mt-2">
+              RMSE: {result?.metrics?.rmse ?? "—"} &nbsp; MAE: {result?.metrics?.mae ?? "—"}
+            </div>
+          </div>
+        </section>
+
+        {/* Right */}
+        <section className="col-span-12 md:col-span-3 space-y-4">
+          <div className="rounded-xl border p-4 text-sm">
+            <div className="font-semibold mb-2">Explainability</div>
+            <div className="prose prose-sm">{result?.explain ?? "Run a question to see a detailed explanation here."}</div>
+          </div>
+          <div className="rounded-xl border p-4 text-sm">
+            <div className="font-semibold mb-2">Details</div>
+            <div>Target: {result?.labels?.target ?? liveTarget ?? "—"}</div>
+            <div>Horizon: {result?.labels?.horizon ?? "—"}</div>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
+}

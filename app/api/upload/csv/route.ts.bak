@@ -1,0 +1,78 @@
+export const runtime = "nodejs";
+
+import { NextResponse } from "next/server";
+import fs from "fs";
+import path from "path";
+import { parse as parseCSV } from "csv-parse/sync";
+import * as XLSX from "xlsx";
+
+function ensureDirs() {
+  const up = path.join(process.cwd(), "data", "uploads");
+  const ds = path.join(process.cwd(), "data", "datasets");
+  fs.mkdirSync(up, { recursive: true });
+  fs.mkdirSync(ds, { recursive: true });
+  return { up, ds };
+}
+
+export async function POST(req: Request) {
+  try {
+    const form = await req.formData();
+    const file = form.get("file") as File | null;
+    if (!file) return NextResponse.json({ error: "No file" }, { status: 400 });
+
+    const name = file.name || "upload";
+    const buf = Buffer.from(await file.arrayBuffer());
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    const mime = (file.type || "").toLowerCase();
+    const id = String(Date.now());
+
+    const { up, ds } = ensureDirs();
+
+    let rows: any[] = [];
+
+    if (ext === "csv" || mime.includes("text/csv")) {
+      // save raw CSV
+      const csvPath = path.join(up, `${id}.csv`);
+      fs.writeFileSync(csvPath, buf);
+
+      // parse CSV -> rows
+      rows = parseCSV(buf.toString("utf8"), {
+        columns: true,
+        skip_empty_lines: true,
+        bom: true,
+        trim: true,
+        relax_column_count: true,
+      });
+    } else if (ext === "xlsx" || ext === "xls" || mime.includes("sheet") || mime.includes("excel")) {
+      // save original Excel
+      const xPath = path.join(up, `${id}.${ext}`);
+      fs.writeFileSync(xPath, buf);
+
+      // parse first sheet -> rows
+      const wb = XLSX.read(buf, { type: "buffer" });
+      const ws = wb.Sheets[wb.SheetNames[0]];
+      rows = XLSX.utils.sheet_to_json(ws, { defval: null }); // keep empty cells
+    } else {
+      return NextResponse.json({ error: `Unsupported file type: .${ext || "unknown"}` }, { status: 415 });
+    }
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return NextResponse.json({ error: "Parsed zero rows. Please check the file contents." }, { status: 400 });
+    }
+
+    // always save JSON snapshot
+    const jsonPath = path.join(ds, `${id}.json`);
+    fs.writeFileSync(jsonPath, JSON.stringify(rows));
+
+    // simple meta
+    const columns = Object.keys(rows[0] || {});
+    return NextResponse.json({
+      id,
+      name,
+      rows: rows.length,
+      columns
+    });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || "Upload failed" }, { status: 500 });
+  }
+}

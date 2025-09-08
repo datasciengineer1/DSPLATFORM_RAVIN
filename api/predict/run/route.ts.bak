@@ -1,0 +1,426 @@
+import { NextResponse } from "next/server";
+import { loadDataset, listNumericColumns, guessDateKey, toNumber, toTime } from "@/utils/datasets";
+
+/* ----------------------- math helpers (no deps) ----------------------- */
+function mean(a: number[]) { return a.reduce((x,y)=>x+y,0)/a.length; }
+function variance(a: number[]) { const m=mean(a); return a.reduce((x,y)=>x+(y-m)*(y-m),0)/a.length; }
+function stdev(a: number[]) { return Math.sqrt(variance(a)); }
+function clamp(x: number, lo: number, hi: number) { return Math.min(hi, Math.max(lo, x)); }
+
+/* ---------- train/val split for quick backtest (last 20%) ------------- */
+function trainValSplit<T>(arr: T[], frac = 0.8) {
+  const n = arr.length;
+  const k = Math.max(1, Math.floor(n * frac));
+  return { train: arr.slice(0, k), val: arr.slice(k) };
+}
+
+/* ----------------------- Moving Average baseline ---------------------- */
+function movingAverage(y: number[], k: number) {
+  const out = Array(y.length).fill(null) as (number|null)[];
+  if (k <= 1) return y.slice();
+  let sum = 0;
+  for (let i = 0; i < y.length; i++) {
+    sum += y[i];
+    if (i >= k) sum -= y[i - k];
+    out[i] = i >= k - 1 ? sum / k : null;
+  }
+  return out;
+}
+
+/* ---------------------- Holt-Winters (additive) ----------------------- */
+/* light grid search over alpha,beta,gamma and season length detection */
+type HWParams = { alpha:number, beta:number, gamma:number, season:number };
+function holtWintersAdditive(y: number[], season: number, alpha: number, beta: number, gamma: number) {
+  const n = y.length;
+  if (season < 2) throw new Error("season must be >= 2");
+  /* initialize */
+  const L = Array(n).fill(0);   // level
+  const B = Array(n).fill(0);   // trend
+  const S = Array(n).fill(0);   // season
+  const m = season;
+
+  // naive initialization
+  const sAvg: number[] = [];
+  for (let i = 0; i < m; i++) {
+    const idx = i;
+    const vals: number[] = [];
+    for (let t = idx; t < n; t += m) vals.push(y[t]);
+    sAvg[i] = vals.length ? mean(vals) : 0;
+  }
+  const base = mean(sAvg);
+  for (let i = 0; i < m; i++) S[i] = (sAvg[i] - base);
+
+  L[0] = y[0] - S[0];
+  B[0] = ((y[m] ?? y[0]) - y[0]) / m;
+
+  for (let t = 1; t < n; t++) {
+    const sPrev = S[(t - m + m*10000) % m]; // seasonal t-m
+    const lPrev = L[t-1], bPrev = B[t-1];
+    const l = alpha * (y[t] - sPrev) + (1 - alpha) * (lPrev + bPrev);
+    const b = beta  * (l - lPrev)   + (1 - beta)  * bPrev;
+    const s = gamma * (y[t] - l)    + (1 - gamma) * sPrev;
+    L[t]=l; B[t]=b; S[t]=s;
+  }
+
+  // in-sample fitted
+  const fit = y.map((_, t) => L[t] + B[t] + S[(t - m + m*10000)%m]);
+  return { fit, level: L, trend: B, season: S };
+}
+
+function detectSeasonMillis(xs: number[]): number {
+  if (xs.length < 3) return 0;
+  const deltas = [];
+  for (let i=1;i<xs.length;i++) deltas.push(xs[i]-xs[i-1]);
+  const md = deltas.sort((a,b)=>a-b)[Math.floor(deltas.length/2)];
+  // rough buckets
+  const day = 86400000;
+  if (Math.abs(md - day) < day*0.2) return 7*day;          // daily → weekly season
+  if (Math.abs(md - 7*day) < day*2) return 52*7*day;      // weekly → yearly season
+  if (Math.abs(md - 30*day) < 7*day) return 12*30*day;    // monthly → yearly season
+  if (Math.abs(md - 90*day) < 20*day) return 4*90*day;    // quarterly
+  return 0;
+}
+function seasonLengthFromMillis(xs: number[], yLen: number) {
+  const sMillis = detectSeasonMillis(xs);
+  if (!sMillis) return Math.min(12, Math.max(3, Math.floor(yLen/10))) || 6;
+  const step = xs[1]-xs[0] || 86400000;
+  return Math.max(3, Math.round(sMillis/step));
+}
+
+function mae(a:number[], b:(number|null)[]) {
+  let s=0, c=0;
+  for (let i=0;i<a.length;i++) if (b[i]!=null) { s += Math.abs(a[i] - (b[i] as number)); c++; }
+  return c? s/c : Infinity;
+}
+function rmse(a:number[], b:(number|null)[]) {
+  let s=0, c=0;
+  for (let i=0;i<a.length;i++) if (b[i]!=null) { const d=a[i]-(b[i] as number); s += d*d; c++; }
+  return c? Math.sqrt(s/c) : Infinity;
+}
+
+/* ----------------------- Linear / Logistic core ----------------------- */
+type Mat = number[][];
+function standardizeCols(X: Mat) {
+  const m = X.length, n = X[0]?.length || 0;
+  const means = Array(n).fill(0), sds = Array(n).fill(1);
+  for (let j=0;j<n;j++) {
+    const col = X.map(r=>r[j]);
+    means[j] = mean(col);
+    sds[j] = stdev(col) || 1;
+    for (let i=0;i<m;i++) X[i][j] = (X[i][j]-means[j])/sds[j];
+  }
+  return { means, sds };
+}
+function sigmoid(z:number){ return 1/(1+Math.exp(-z)); }
+
+/* ridge linear regression via gradient descent */
+function fitLinearRidge(X:Mat, y:number[], lr=0.05, iters=400, l2=0.5){
+  const m=X.length, n=X[0].length;
+  const w = Array(n).fill(0);
+  let b = 0;
+  for(let t=0;t<iters;t++){
+    let db=0;
+    const dw = Array(n).fill(0);
+    for(let i=0;i<m;i++){
+      const yhat = X[i].reduce((s, xj, j)=> s + w[j]*xj, b);
+      const err = yhat - y[i];
+      db += err;
+      for(let j=0;j<n;j++) dw[j] += err * X[i][j];
+    }
+    b -= lr * db/m;
+    for(let j=0;j<n;j++) w[j] = w[j]*(1 - lr*l2/m) - lr * dw[j]/m;
+  }
+  return { w, b };
+}
+
+/* logistic regression via gradient descent */
+function fitLogistic(X:Mat, y:number[], lr=0.05, iters=600, l2=0.1){
+  const m=X.length, n=X[0].length;
+  const w = Array(n).fill(0);
+  let b = 0;
+  for(let t=0;t<iters;t++){
+    let db=0; const dw=Array(n).fill(0);
+    for(let i=0;i<m;i++){
+      const z = X[i].reduce((s, xj, j)=> s + w[j]*xj, b);
+      const p = sigmoid(z);
+      const err = p - y[i];
+      db += err;
+      for(let j=0;j<n;j++) dw[j] += err * X[i][j];
+    }
+    b -= lr * db/m;
+    for(let j=0;j<n;j++) w[j] = w[j]*(1 - lr*l2/m) - lr * dw[j]/m;
+  }
+  return { w, b };
+}
+
+function accuracy(y:number[], yhat:number[]){ 
+  let c=0; for(let i=0;i<y.length;i++) if(y[i]===yhat[i]) c++; return c/y.length;
+}
+function precisionRecall(y:number[], yhat:number[]){
+  let tp=0, fp=0, fn=0;
+  for(let i=0;i<y.length;i++){
+    if (yhat[i]===1 && y[i]===1) tp++;
+    if (yhat[i]===1 && y[i]===0) fp++;
+    if (yhat[i]===0 && y[i]===1) fn++;
+  }
+  const prec = tp/(tp+fp || 1);
+  const rec  = tp/(tp+fn || 1);
+  return { precision: prec, recall: rec };
+}
+
+/* ----------------------------- main API -------------------------------- */
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const datasetId = String(body?.datasetId || "");
+    const question = String(body?.question || "");
+    const forceForecast = !!body?.forceForecast;
+    const desiredHorizon = body?.horizon ?? null;
+
+    const ds = loadDataset(datasetId);
+    const rows = ds.rows;
+
+    // target selection
+    const targetMatch = /\[target\s*=\s*([^\]]+)\]/i.exec(question);
+    let target = targetMatch?.[1]?.trim() || null;
+    const numeric = listNumericColumns(rows);
+    if (!target || !numeric.includes(target)) {
+      const pref = ["revenue","sales","profit","cogs","amount","value","target"];
+      target = numeric.find(c=>pref.includes(c.toLowerCase())) || numeric[0] || null;
+    }
+    if (!target) throw new Error("No numeric target column found.");
+
+    // task detection
+    const isForecastInQ = /(forecast|next\s+\d+)/i.test(question);
+    const classWords = /(probability|risk|will|survive|churn|default|win|lose)/i.test(question);
+    let task: "forecast" | "regression" | "classification" =
+      forceForecast || isForecastInQ ? "forecast" :
+      classWords ? "classification" : "regression";
+
+    // horizon
+    let horizon: number | null = null;
+    const hz = /next\s+(\d+)/i.exec(question);
+    if (hz) horizon = parseInt(hz[1], 10);
+    if (desiredHorizon && Number.isFinite(desiredHorizon)) horizon = desiredHorizon;
+    if (!horizon && task === "forecast") horizon = 2;
+
+    // x axis
+    const xKey = guessDateKey(rows) || "__index__";
+
+    // build chronological series
+    let chron: { x: number, y: number, row?: any }[] = [];
+    if (xKey === "__index__") {
+      rows.forEach((r, i) => chron.push({ x: i, y: toNumber(r[target!]), row:r }));
+    } else {
+      // keep row reference (latest per timestamp)
+      const map = new Map<number, { y:number, row:any }>();
+      for (const r of rows) {
+        const x = toTime(r[xKey]);
+        const y = toNumber(r[target!]);
+        const curr = map.get(x);
+        map.set(x, { y: (curr?.y || 0) + y, row:r });
+      }
+      chron = Array.from(map.entries()).sort((a,b)=>a[0]-b[0]).map(([x, obj]) => ({ x, y: obj.y, row: obj.row }));
+    }
+    const xs = chron.map(p=>p.x);
+    const y = chron.map(p=>p.y);
+
+    /* ---------------------------- FORECAST ---------------------------- */
+    if (task === "forecast") {
+      const sLen = seasonLengthFromMillis(xs, y.length);
+      const { train: yTr, val: yVal } = trainValSplit(y, 0.8);
+
+      // candidates: moving average (k grid) vs Holt-Winters grid
+      const kGrid = [3, 5, 7, 12, 21].filter(k=>k<y.length);
+      let best = { name: "MovingAverage", mae: Infinity, rmse: Infinity, fit: [] as (number|null)[], params:{} as any };
+
+      for (const k of kGrid) {
+        const fit = movingAverage(y, k);
+        const splitIdx = yTr.length;
+        const maeVal = mae(y.slice(splitIdx), fit.slice(splitIdx));
+        const rmseVal = rmse(y.slice(splitIdx), fit.slice(splitIdx));
+        if (maeVal < best.mae) best = { name:"MovingAverage", mae: maeVal, rmse: rmseVal, fit, params:{k} };
+      }
+
+      const grid = [0.2,0.4,0.6,0.8];
+      for (const a of grid) for (const b of [0.1,0.2,0.3]) for (const g of grid) {
+        try {
+          const hw = holtWintersAdditive(y, sLen, a, b, g);
+          const fit = hw.fit as (number|null)[];
+          const splitIdx = yTr.length;
+          const maeVal = mae(y.slice(splitIdx), fit.slice(splitIdx));
+          const rmseVal = rmse(y.slice(splitIdx), fit.slice(splitIdx));
+          if (maeVal < best.mae) best = { name:"Holt-Winters (additive)", mae: maeVal, rmse: rmseVal, fit, params:{alpha:a,beta:b,gamma:g,season:sLen} };
+        } catch {}
+      }
+
+      // forecast next horizon with last level/trend/season if HW; else extend last MA
+      const lastFit = best.fit;
+      let future: { x:number, y:number }[] = [];
+      const lastX = xs.at(-1) ?? 0;
+      if (best.name.startsWith("Holt")) {
+        const hw = holtWintersAdditive(y, sLen, best.params.alpha, best.params.beta, best.params.gamma);
+        for (let i=1;i<= (horizon as number); i++){
+          const s = hw.season[(y.length - sLen + i) % sLen];
+          const pred = (hw.level.at(-1) ?? 0) + (hw.trend.at(-1) ?? 0) * i + s;
+          const nextX = xKey==="__index__" ? y.length + (i-1) : lastX + i * (xs[1]-xs[0] || 86400000);
+          future.push({ x: nextX, y: pred });
+        }
+      } else {
+        const lastMA = lastFit.filter(v=>v!=null).at(-1) ?? y.at(-1) ?? 0;
+        for (let i=1;i<= (horizon as number); i++){
+          const nextX = xKey==="__index__" ? y.length + (i-1) : lastX + i * (xs[1]-xs[0] || 86400000);
+          future.push({ x: nextX, y: lastMA });
+        }
+      }
+
+      const merged = [
+        ...y.map((yy,i)=>({ x: xs[i], actual: yy, forecast: lastFit[i] })),
+        ...future.map(p=>({ x:p.x, actual:null, forecast:p.y })),
+      ];
+
+      const series = merged.slice(-600);
+      const labels = { title:`Forecast of ${target}`, target, horizon, xKey, model: best.name };
+      const metrics = { rmse: best.rmse===Infinity? null: best.rmse, mae: best.mae===Infinity? null: best.mae, rowsUsed: y.length };
+
+      const explain =
+`### Summary for: ${question}
+
+**Task:** Forecasting
+**Model:** ${best.name}
+**Target:** ${target}
+**Horizon:** ${horizon}
+**Rows used:** ${metrics.rowsUsed}
+
+**Validation (last 20%):** RMSE=${metrics.rmse ? Math.round(metrics.rmse).toLocaleString() : "—"}, MAE=${metrics.mae ? Math.round(metrics.mae).toLocaleString() : "—"}.
+
+**Interpretation:** ${best.name} selected by lowest MAE on a hold-out split. Compare orange (forecast) vs blue (actual).`;
+
+      return NextResponse.json({ task, labels, metrics, series, explain });
+    }
+
+    /* ------------------------ FEATURES for tabular ------------------------ */
+    // choose up to 8 numeric features excluding target + date
+    const numCols = numeric.filter(c=>c!==target && c!==xKey);
+    const sampleRow = rows[0] || {};
+    const feats = numCols.slice(0, 32); // initial cap
+    const X: number[][] = [];
+    const yTab: number[] = [];
+    for (const r of rows) {
+      const xi = feats.map(f=> toNumber(r[f]));
+      if (xi.every(v=>Number.isFinite(v))) { X.push(xi); yTab.push(toNumber(r[target])); }
+    }
+    if (X.length < 5) throw new Error("Not enough numeric features to fit a model.");
+
+    // standardize
+    const { means, sds } = standardizeCols(X);
+
+    // reduce to top 8 by absolute correlation
+    function pearson(col:number[], tgt:number[]){
+      const mc = mean(col), mt = mean(tgt);
+      let num=0, den1=0, den2=0;
+      for(let i=0;i<col.length;i++){
+        const a=col[i]-mc, b=tgt[i]-mt;
+        num+=a*b; den1+=a*a; den2+=b*b;
+      }
+      const d = Math.sqrt(den1*den2)||1;
+      return num/d;
+    }
+    const abscorr = feats.map((f, j)=> ({ f, j, c: Math.abs(pearson(X.map(r=>r[j]), yTab)) }));
+    abscorr.sort((a,b)=> b.c - a.c);
+    const keep = abscorr.slice(0, Math.min(8, abscorr.length)).map(o=>o.j);
+    const Xk = X.map(r=> keep.map(j=> r[j]));
+    const keptFeatNames = keep.map(j=> feats[j]);
+
+    /* ----------------------------- REGRESSION ----------------------------- */
+    if (task === "regression") {
+      const { train: Xtr, val: Xval } = trainValSplit(Xk, 0.8);
+      const { train: ytr, val: yval } = trainValSplit(yTab, 0.8);
+
+      const model = fitLinearRidge(Xtr, ytr, 0.05, 400, 0.5);
+      const yhatAll = Xk.map(xi => xi.reduce((s,xj,j)=> s + model.w[j]*xj, model.b));
+
+      const split = Xtr.length;
+      const rmseVal = rmse(yTab.slice(split), yhatAll.slice(split));
+      const maeVal  = mae(yTab.slice(split), yhatAll.slice(split));
+
+      const series = yTab.map((yi,i)=> ({ x: i, actual: yi, forecast: yhatAll[i] })).slice(-600);
+      const coef = keptFeatNames.map((name, j)=> ({ feature: name, weight: model.w[j] }));
+
+      const labels = { title:`Regression on ${target}`, target, horizon:null, xKey:"__index__", model:"Ridge (GD)" };
+      const metrics = { rmse: rmseVal===Infinity? null: rmseVal, mae: maeVal===Infinity? null: maeVal, rowsUsed: yTab.length };
+
+      const top = coef.slice().sort((a,b)=> Math.abs(b.weight)-Math.abs(a.weight)).slice(0,5)
+        .map(c=> `- ${c.feature}: **${c.weight.toFixed(3)}**`).join("\n");
+
+      const explain =
+`### Summary for: ${question}
+
+**Task:** Regression
+**Model:** Ridge (gradient descent)
+**Target:** ${target}
+**Rows used:** ${metrics.rowsUsed}
+**Validation (last 20%):** RMSE=${metrics.rmse ? metrics.rmse.toFixed(2) : "—"}, MAE=${metrics.mae ? metrics.mae.toFixed(2) : "—"}.
+
+**Top coefficients (standardized features):**
+${top || "n/a"}
+
+**Interpretation:** Positive weights increase predictions; negative weights decrease them (holding others fixed).`;
+
+      return NextResponse.json({ task, labels, metrics, series, explain, coefficients: coef });
+    }
+
+    /* --------------------------- CLASSIFICATION --------------------------- */
+    // binarize target (if not already 0/1)
+    const uniq = Array.from(new Set(rows.map(r=> String(r[target!]))));
+    if (uniq.length !== 2) {
+      // fallback to regression if not binary
+      const altQuestion = question + " [Note: auto-fell back to regression (target not binary)]";
+      return NextResponse.json({ error: "Target is not binary; try specifying a binary target or switch to regression.", hint: altQuestion });
+    }
+    const posLabel = uniq[1];
+    const yCls = rows.map(r => String(r[target!]) === posLabel ? 1 : 0).slice(0, Xk.length);
+
+    const { train: Xtr, val: Xval } = trainValSplit(Xk, 0.8);
+    const { train: ytr, val: yval } = trainValSplit(yCls.slice(0,Xk.length), 0.8);
+
+    const lg = fitLogistic(Xtr, ytr, 0.05, 600, 0.1);
+    const probAll = Xk.map(xi => sigmoid(xi.reduce((s,xj,j)=> s + lg.w[j]*xj, lg.b)));
+    const yhatAll = probAll.map(p => p>=0.5 ? 1 : 0);
+
+    const split = Xtr.length;
+    const acc = accuracy(yCls.slice(split), yhatAll.slice(split));
+    const pr  = precisionRecall(yCls.slice(split), yhatAll.slice(split));
+
+    const series = probAll.map((p,i)=> ({ x:i, actual: yCls[i], forecast: p })).slice(-600);
+    const coef = keptFeatNames.map((name, j)=> ({ feature: name, weight: lg.w[j] }));
+
+    const labels = { title:`Classification on ${target}`, target, horizon:null, xKey:"__index__", model:"Logistic (GD)" };
+    const metrics = { rmse: null, mae: null, rowsUsed: yCls.length };
+
+    const top = coef.slice().sort((a,b)=> Math.abs(b.weight)-Math.abs(a.weight)).slice(0,5)
+      .map(c=> `- ${c.feature}: **${c.weight.toFixed(3)}**`).join("\n");
+
+    const explain =
+`### Summary for: ${question}
+
+**Task:** Classification
+**Model:** Logistic regression (gradient descent)
+**Target:** ${target} (positive class: "${posLabel}")
+**Rows used:** ${metrics.rowsUsed}
+
+**Validation (last 20%):**
+- Accuracy: ${(acc*100).toFixed(1)}%
+- Precision: ${(pr.precision*100).toFixed(1)}%
+- Recall: ${(pr.recall*100).toFixed(1)}%
+
+**Top coefficients (standardized features):**
+${top || "n/a"}
+
+**Interpretation:** Positive weights increase odds of the positive class; negative weights decrease them.`;
+
+    return NextResponse.json({ task, labels, metrics, series, explain, coefficients: coef });
+  } catch (e:any) {
+    return NextResponse.json({ error: e?.message || "Predict failed." });
+  }
+}

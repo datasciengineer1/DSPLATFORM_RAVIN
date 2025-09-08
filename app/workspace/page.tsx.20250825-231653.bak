@@ -1,0 +1,160 @@
+'use client';
+import React, { useEffect, useMemo, useState } from 'react';
+import EDACompact from '../components/EDACompact';
+
+/* helpers */
+async function fetchJSON(path: string) {
+  const r = await fetch(path);
+  if (!r.ok) throw new Error(`${path} ${r.status}`);
+  return r.json();
+}
+async function postJSON(path: string, body: any) {
+  const r = await fetch(path, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body ?? {}) });
+  if (!r.ok) throw new Error(`POST ${path} ${r.status}`);
+  return r.json();
+}
+/** CSV parser with number/date coercion (commas/$ handled) */
+function parseCSV(text: string, limit = 200): { rows: any[]; columns: string[] } {
+  const rows: string[][] = []; let cur: string[] = []; let field=''; let inQ=false;
+  for (let i=0;i<text.length;i++){
+    const c=text[i];
+    if(inQ){ if(c==='"'){ if(text[i+1]==='"'){field+='"'; i++;} else inQ=false; } else field+=c; }
+    else { if(c==='"') inQ=true; else if(c===','){ cur.push(field); field=''; }
+           else if(c==='\n'){ cur.push(field); rows.push(cur); cur=[]; field=''; }
+           else if(c!=='\r') field+=c; }
+  }
+  if(field.length||cur.length){ cur.push(field); rows.push(cur); }
+  if(!rows.length) return {rows:[],columns:[]};
+  const header = rows[0].map(h => (h??'').trim());
+  const out = rows.slice(1,201).map(r => {
+    const o:any={}; for(let i=0;i<header.length;i++) o[header[i]||`col_${i+1}`]=r[i]??''; return o;
+  });
+  const numRe = /^-?\s*\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^-?\s*\$?\s*\d+(?:\.\d+)?$/;
+  const dateRe= /^(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|[0-9]{4}\-[0-9]{2}\-[0-9]{2})$/;
+  out.forEach(o=>Object.keys(o).forEach(k=>{
+    let v=(o[k]??'').toString().trim(); if(!v) return;
+    if(numRe.test(v)){ o[k]=Number(v.replace(/[\$,]/g,'')); return; }
+    if(dateRe.test(v)){ const d=new Date(v); if(!isNaN(+d)) o[k]=d.toISOString(); }
+  }));
+  return { rows: out, columns: header };
+}
+
+type SourceTab = 'DEMO'|'CSV';
+
+export default function WorkspacePage(){
+  const [sourceTab,setSourceTab]=useState<SourceTab>('DEMO');
+  const [datasets,setDatasets]=useState<any[]>([]);
+  const [datasetId,setDatasetId]=useState<string>('');
+  const [preview,setPreview]=useState<any[]>([]);
+  const [columns,setColumns]=useState<string[]>([]);
+  const [busy,setBusy]=useState<string>('');
+
+  // load demo sources
+  useEffect(()=>{ (async()=>{
+    try{ setDatasets(await fetchJSON('/api/data/sources')||[]); } catch{ setDatasets([]); }
+  })(); }, []);
+
+  const demoOptions = useMemo(()=> (datasets||[]).map((d:any)=>({
+    id: d.id||d.name||String(d), label: d.label||d.name||d.id||String(d)
+  })), [datasets]);
+
+  // preview when a DEMO dataset is picked
+  useEffect(()=>{ if(!datasetId || datasetId.startsWith('local:')) return;
+    (async()=>{
+      setBusy('Loading preview…');
+      try{
+        const ds=(datasets||[]).find((d:any)=>(d.id||d.name||'')===datasetId)||{};
+        const tries=[ {id: ds.id??datasetId, limit:200}, {name: ds.name??datasetId, limit:200} ];
+        let resp:any=null, err:any=null;
+        for(const body of tries){ try{ resp=await postJSON('/api/data/preview', body); if(resp?.rows) break; }catch(e){err=e;} }
+        if(!resp?.rows) throw err||new Error('preview failed');
+        setPreview(resp.rows); setColumns(resp.rows[0]?Object.keys(resp.rows[0]):[]);
+      } catch{ setPreview([]); setColumns([]); }
+      finally{ setBusy(''); }
+    })();
+  },[datasetId, datasets]);
+
+  // CSV upload (local parse; no tab switch)
+  async function uploadCSV(file: File){
+    try{
+      setSourceTab('CSV');
+      setBusy('Parsing CSV…');
+      const {rows,columns} = parseCSV(await file.text());
+      setPreview(rows); setColumns(columns); setDatasetId(`local:${file.name}`);
+      setBusy('Uploading CSV…');
+      try{
+        const fd=new FormData(); fd.append('file',file);
+        await fetch('/api/data/upload',{method:'POST', body:fd});
+        setDatasets(await fetchJSON('/api/data/sources').catch(()=>[]));
+      } finally { setBusy(''); }
+    } catch { setBusy(''); }
+  }
+
+  const hasData = preview.length>0;
+
+  return (
+    <main className="container">
+      <div style={{display:'flex',alignItems:'center',gap:12,padding:12}}>
+        <strong>Workflow:</strong>
+        <div className="segtabs">
+          <span className={`seg ${hasData?'':'active'}`}>1. Data</span>
+          <span className={`seg ${hasData?'active':''}`}>2. EDA</span>
+        </div>
+        {busy && <div className="loading" style={{marginLeft:'auto'}}><span className="spinner" /> <span>{busy}</span></div>}
+      </div>
+
+      <div className="grid3-root">
+        {/* Left summary */}
+        <div className="col left-pane">
+          <div className="card"><h2>Summary</h2><div className="body">
+            <ul className="muted">
+              <li>{preview.length} rows</li>
+              <li>{columns.length} columns</li>
+            </ul>
+          </div></div>
+        </div>
+
+        {/* Center: EDA */}
+        <div className="col center-pane">
+          <div className="center-scroll">
+            {hasData ? (
+              <EDACompact rows={preview} columns={columns}/>
+            ) : (
+              <div className="card"><h2>EDA</h2><div className="body muted">Pick a dataset on the right or upload a CSV.</div></div>
+            )}
+          </div>
+        </div>
+
+        {/* Right: Data sources (DEMO + CSV only) */}
+        <div className="col right-pane">
+          <div className="card"><h2>Data sources</h2>
+            <div className="body" style={{display:'grid',gap:8}}>
+              <div className="segtabs">
+                <button className={`seg ${sourceTab==='DEMO'?'active':''}`} onClick={()=>setSourceTab('DEMO')}>DEMO</button>
+                <button className={`seg ${sourceTab==='CSV'?'active':''}`} onClick={()=>setSourceTab('CSV')}>CSV</button>
+              </div>
+
+              {sourceTab==='DEMO' && (
+                <div style={{display:'grid',gap:6}}>
+                  <label className="muted">Dataset</label>
+                  <select value={datasetId} onChange={e=>setDatasetId(e.target.value)}>
+                    <option value="" disabled>Select a dataset…</option>
+                    {demoOptions.map(o=><option key={o.id} value={o.id}>{o.label}</option>)}
+                  </select>
+                </div>
+              )}
+
+              {sourceTab==='CSV' && (
+                <div style={{display:'grid',gap:6}}>
+                  <label className="muted">Upload CSV</label>
+                  <input type="file" accept=".csv" onChange={e=>{const f=e.target.files?.[0]; if(f) uploadCSV(f);}} />
+                  <div className="muted">We parse locally so EDA shows instantly.</div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  );
+}

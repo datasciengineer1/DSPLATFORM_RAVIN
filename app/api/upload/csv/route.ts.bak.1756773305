@@ -1,0 +1,210 @@
+import { NextResponse } from "next/server";
+import { parse } from "csv-parse/sync";
+import * as fs from "fs";
+import * as path from "path";
+import { coerceRows, saveDatasetSync, datasetPath } from "@/utils/datasets";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+// --- local helpers (no utils imports) ---
+type Row = Record<string, any>;
+const DATA_DIR = path.join(process.cwd(), "data", "datasets");
+const datasetPath = (id: string) => path.join(DATA_DIR, `${id}.json`);
+
+function coerceRows(rows: Row[]): Row[] {
+  return rows.map(row => {
+    const out: Row = {};
+    for (const [k, v] of Object.entries(row)) {
+      if (v === "" || v === null || v === undefined) { out[k] = null; continue; }
+      const s = String(v).trim();
+      const n = Number(s.replace(/,/g, ""));
+      if (s !== "" && Number.isFinite(n) && /^-?\d+(\.\d+)?(e[-+]?\d+)?$/i.test(s.replace(/,/g,""))) {
+        out[k] = n; continue;
+      }
+      const d = new Date(s);
+      if (!isNaN(d.getTime())) { out[k] = s; continue; }
+      out[k] = s;
+    }
+    return out;
+  });
+}
+function listNumericColumns(rows: Row[], minRatio = 0.8): string[] {
+  if (!rows.length) return [];
+  const cols = Object.keys(rows[0] || {});
+  const hits: string[] = [];
+  for (const c of cols) {
+    let good = 0, total = 0;
+    for (const r of rows) {
+      const v = r[c];
+      if (v === null || v === undefined || v === "") continue;
+      total++;
+      const n = typeof v === "number" ? v : Number(String(v).replace(/,/g, ""));
+      if (Number.isFinite(n)) good++;
+    }
+    if (total > 0 && good / total >= minRatio) hits.push(c);
+  }
+  return hits;
+}
+function detectDateColumn(rows: Row[], minRatio = 0.7): string | null {
+  if (!rows.length) return null;
+  const cols = Object.keys(rows[0] || {});
+  for (const c of cols) {
+    let good = 0, total = 0;
+    for (const r of rows) {
+      const v = r[c];
+      if (v === null || v === undefined || v === "") continue;
+      total++;
+      const d = new Date(v);
+      if (!isNaN(d.getTime())) good++;
+    }
+    if (total > 0 && good / total >= minRatio) return c;
+  }
+  return null;
+}
+function sniffDelimiter(text: string): string {
+  const candidates = [",", "\t", ";", "|"];
+  let best = ",", bestCount = -1;
+  for (const d of candidates) {
+    const count = (text.match(new RegExp(d === "\t" ? "\\t" : `\\${d}`, "g")) || []).length;
+    if (count > bestCount) { best = d; bestCount = count; }
+  }
+  return best;
+}
+function countBy(arr: (string|number)[]) {
+  const m = new Map<string, number>();
+  for (const v of arr) m.set(String(v), (m.get(String(v)) || 0) + 1);
+  return Array.from(m, ([name, value]) => ({ name, value }));
+}
+function histogram(nums: number[], bins = 12) {
+  const vals = nums.filter(Number.isFinite);
+  if (!vals.length) return [];
+  const min = Math.min(...vals), max = Math.max(...vals);
+  if (min === max) return [{ name: String(min), value: vals.length }];
+  const step = (max - min) / bins;
+  const edges = Array.from({ length: bins + 1 }, (_, i) => min + i * step);
+  const counts = Array(bins).fill(0);
+  for (const v of vals) {
+    let idx = Math.floor((v - min) / step);
+    if (idx < 0) idx = 0; if (idx >= bins) idx = bins - 1;
+    counts[idx]++;
+  }
+  const label = (i: number) => `${Math.round(edges[i])}-${Math.round(edges[i+1])}`;
+  return counts.map((c, i) => ({ name: label(i), value: c }));
+}
+function pearson(xs: number[], ys: number[]) {
+  const n = Math.min(xs.length, ys.length);
+  let sx=0, sy=0, sxx=0, syy=0, sxy=0, k=0;
+  for (let i=0;i<n;i++) {
+    const x = xs[i], y = ys[i];
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+    sx += x; sy += y; sxx += x*x; syy += y*y; sxy += x*y; k++;
+  }
+  if (k === 0) return 0;
+  const mx = sx/k, my = sy/k;
+  const vx = sxx/k - mx*mx, vy = syy/k - my*my;
+  const denom = Math.sqrt(vx*vy) || 0;
+  return denom ? (sxy/k - mx*my)/denom : 0;
+}
+
+export async function POST(req: Request) {
+  try {
+    const form = await req.formData();
+    const file = form.get("file") as File | null;
+    if (!file) return NextResponse.json({ error: "Missing 'file' field" }, { status: 400 });
+
+    const fname = file.name || "upload.csv";
+    if (/\.(xlsx?|xls)$/i.test(fname)) {
+      return NextResponse.json({ error: "Excel files are not supported. Upload a .csv." }, { status: 415 });
+    }
+
+    const text = new TextDecoder("utf-8").decode(Buffer.from(await file.arrayBuffer()));
+    const delimiter = sniffDelimiter(text);
+    const records = parse(text, { columns: true, skip_empty_lines: true, delimiter, trim: true }) as any[];
+    if (!Array.isArray(records) || records.length === 0) {
+      return NextResponse.json({ error: "No rows found in CSV" }, { status: 400 });
+    }
+
+    const rows: Row[] = coerceRows(records);
+    const id = String(Date.now());
+    const name = fname.replace(/^.*[\\\/]/, "");
+
+    // derive fields + EDA
+    const numeric = listNumericColumns(rows);
+    const dateCol = detectDateColumn(rows);
+    const nonNum = rows.length ? Object.keys(rows[0]).filter(c => !numeric.includes(c) && c !== dateCol) : [];
+
+    const xCogs   = numeric[0] || null;
+    const yRevenue= numeric[1] || numeric[0] || null;
+    const category= nonNum.find(c => /cat|type|segment|group/i.test(c)) || nonNum[0] || null;
+    const location= nonNum.find(c => /city|state|region|location|country/i.test(c)) || nonNum[1] || nonNum[0] || null;
+    const date    = dateCol || null;
+
+    const numsX = xCogs ? rows.map(r => Number(r[xCogs])).filter(Number.isFinite) : [];
+    const numsY = yRevenue ? rows.map(r => Number(r[yRevenue])).filter(Number.isFinite) : [];
+
+    const distCOGS     = histogram(numsX);
+    const distRevenue  = histogram(numsY);
+    const countsByCategory = category ? countBy(rows.map(r => String(r[category] ?? ""))).sort((a,b)=>b.value-a.value).slice(0,12) : [];
+    const shareByCity      = location ? countBy(rows.map(r => String(r[location] ?? ""))).sort((a,b)=>b.value-a.value).slice(0,12) : [];
+    const cogsVsRevenue    = (xCogs && yRevenue) ? rows.slice(0,500).map(r => ({ x: Number(r[xCogs]), y: Number(r[yRevenue]) }))
+                                                  .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y)) : [];
+
+    const trend = new Map<string, number>();
+    if (date) {
+      for (const r of rows) {
+        const d = new Date(String(r[date]));
+        if (isNaN(d.getTime())) continue;
+        const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+        const val = xCogs ? Number(r[xCogs]) : (yRevenue ? Number(r[yRevenue]) : NaN);
+        if (!Number.isFinite(val)) continue;
+        trend.set(key, (trend.get(key) || 0) + val);
+      }
+    }
+    const trendCogsByMonth = Array.from(trend.entries()).sort((a,b)=>a[0].localeCompare(b[0])).map(([name, value])=>({ name, value }));
+
+    const missingCounts = rows.length ? Object.keys(rows[0]).map(col => {
+      const miss = rows.reduce((acc, r) => acc + ((r[col] === null || r[col] === undefined || r[col] === "") ? 1 : 0), 0);
+      return { column: col, count: miss };
+    }).sort((a,b)=>b.count-a.count) : [];
+
+    const pairs: { x: string, y: string, r: number }[] = [];
+    for (let i=0;i<numeric.length;i++) for (let j=i+1;j<numeric.length;j++) {
+      const xi = numeric[i], yj = numeric[j];
+      const xs = rows.map(r => Number(r[xi])).filter(Number.isFinite);
+      const ys = rows.map(r => Number(r[yj])).filter(Number.isFinite);
+      const r  = pearson(xs, ys);
+      if (Number.isFinite(r)) pairs.push({ x: xi, y: yj, r });
+    }
+    pairs.sort((a,b)=>Math.abs(b.r)-Math.abs(a.r));
+    const topPairs = pairs.slice(0,20);
+
+    const payload = {
+      id, name, rows,
+      fields: { xCogs, yRevenue, category, location, date },
+      rowCount: rows.length,
+      colCount: rows.length ? Object.keys(rows[0]).length : 0,
+      numericCount: numeric.length,
+      categoricalCount: nonNum.length,
+      insights: [
+        (xCogs && yRevenue) ? `${yRevenue} correlates ${Math.abs(pearson(numsX, numsY)).toFixed(2)} with ${xCogs}` : undefined,
+        date ? `Data spans ${trendCogsByMonth.length} months` : undefined,
+      ].filter(Boolean),
+      distCOGS,
+      distRevenue,
+      countsByCategory,
+      shareByCity,
+      cogsVsRevenue,
+      trendCogsByMonth,
+      missing: { top: missingCounts.slice(0, 10) },
+      corr: { pairs: topPairs }
+    };
+
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(datasetPath(id), JSON.stringify(payload), "utf-8");
+
+    return NextResponse.json({ id, name, preview: rows.slice(0, 100), rowCount: rows.length, delimiter });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 });
+  }
+}

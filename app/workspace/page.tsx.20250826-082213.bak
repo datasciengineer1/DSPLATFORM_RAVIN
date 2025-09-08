@@ -1,0 +1,294 @@
+'use client';
+import React, { useEffect, useMemo, useState } from 'react';
+import ExplainPanel from '../components/ExplainPanel';
+import EDACompact from '../components/EDACompact';
+
+/* helpers */
+async function fetchJSON(p:string){ const r=await fetch(p); if(!r.ok) throw new Error(`${p} ${r.status}`); return r.json(); }
+async function postJSON(p:string,b:any){ const r=await fetch(p,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b??{})}); if(!r.ok) throw new Error(`POST ${p} ${r.status}`); return r.json();}
+function parseCSV(t:string,l=200){const R:string[][]=[],o:string[]=[];let f='',q=false;for(let i=0;i<t.length;i++){const c=t[i];if(q){if(c=='"'){if(t[i+1]=='"'){f+='"';i++;}else q=false;}else f+=c;}else{if(c=='"')q=true;else if(c==','){o.push(f);f='';}else if(c=='\n'){o.push(f);R.push(o.slice());o.length=0;f='';}else if(c!='\r')f+=c;}}if(f.length||o.length){o.push(f);R.push(o);} if(!R.length)return{rows:[],columns:[]}; const h=R[0].map(x=>(x??'').trim()); const out=R.slice(1,1+l).map(r=>{const o:any={}; for(let i=0;i<h.length;i++) o[h[i]||`col_${i+1}`]=r[i]??''; return o;}); const num=/^-?\s*\$?\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^-?\s*\$?\s*\d+(?:\.\d+)?$/; const dat=/^(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|[0-9]{4}\-[0-9]{2}\-[0-9]{2})$/; out.forEach(o=>Object.keys(o).forEach(k=>{let v=(o[k]??'').toString().trim(); if(!v)return; if(num.test(v)){o[k]=Number(v.replace(/[\$,]/g,'')); return;} if(dat.test(v)){const d=new Date(v); if(!isNaN(+d)) o[k]=d.toISOString();}})); return {rows:out,columns:h};}
+
+/* tiny viz helpers for right metrics */
+function Card({title,children}:{title:string;children:any}){return(<div className="card"><h2>{title}</h2><div className="body">{children}</div></div>)}
+function Confusion({cm}:{cm:number[][]|null}){ if(!cm||cm.length!==2) return <div className="muted">No model run yet.</div>; const [[tn,fp],[fn,tp]]=cm as any; const cells=[{v:tn,l:'TN'},{v:fp,l:'FP'},{v:fn,l:'FN'},{v:tp,l:'TP'}]; const m=Math.max(...cells.map(c=>c.v),1); return (<svg viewBox="0 0 100 100" style={{width:'100%',height:180}}>{cells.map((c,i)=><rect key={i} x={(i%2)*50+2} y={Math.floor(i/2)*50+2} width={46} height={46} rx="6" fill="#6b8aff" opacity={0.35+(0.65*c.v/m)} />)}<text x="25" y="32" textAnchor="middle" fontSize="12">TN</text><text x="75" y="32" textAnchor="middle" fontSize="12">FP</text><text x="25" y="82" textAnchor="middle" fontSize="12">FN</text><text x="75" y="82" textAnchor="middle" fontSize="12">TP</text></svg>); }
+function ROC({points}:{points:number[]|null}){ if(!points||!points.length) return <div className="muted">No ROC yet.</div>; const p=points.map((y,i)=>`${(i/(points.length-1))*100},${100-(y*100)}`).join(' '); return (<svg viewBox="0 0 100 100" style={{width:'100%',height:180}}><polyline points="0,100 100,0" stroke="#aaa" fill="none"/><polyline points={p} stroke="#2563eb" fill="none" strokeWidth="2"/></svg>); }
+function Hist({bins}:{bins:number[]|null}){ if(!bins||!bins.length) return <div className="muted">No predictions yet.</div>; const m=Math.max(...bins,1), w=100/bins.length; return (<svg viewBox="0 0 100 40" style={{width:'100%',height:180}}>{bins.map((b,i)=><rect key={i} x={i*w+1} y={40-(b/m)*38} width={w-2} height={(b/m)*38} fill="#6b8aff" rx="1"/>)}</svg>); }
+function Drivers({pairs}:{pairs:{name:string,value:number}[]|null}){ if(!pairs||!pairs.length) return <div className="muted">Not available yet.</div>; const m=Math.max(...pairs.map(p=>Math.abs(p.value)),1); return(<div style={{display:'grid',gap:6}}>{pairs.slice(0,8).map(p=>(<div key={p.name}><div className="muted" style={{fontSize:12}}>{p.name}</div><div style={{height:8,background:'#e5e7eb',borderRadius:6}}><div style={{width:`${(Math.abs(p.value)/m)*100}%`,height:8,background:'#6b8aff',borderRadius:6}}/></div></div>))}</div>); }
+
+type SourceTab='DEMO'|'CSV'|'POSTGRES'|'SQLITE'|'BIGQUERY';
+type ModelMode='auto'|'manual';
+
+export default function WorkspacePage(){
+  const [activeStep,setActiveStep]=useState(2);
+  const [sourceTab,setSourceTab]=useState<SourceTab>('CSV');
+
+  const [datasets,setDatasets]=useState<any[]>([]);
+  const [datasetId,setDatasetId]=useState<string>('');
+  const [preview,setPreview]=useState<any[]>([]);
+  const [columns,setColumns]=useState<string[]>([]);
+  const [busy,setBusy]=useState<string>('');
+
+  // pagination (15/pg)
+  const [page,setPage]=useState(1);
+  const pageSize=15;
+  const totalPages=Math.max(1,Math.ceil(preview.length/pageSize));
+  const pageRows = useMemo(()=> preview.slice((page-1)*pageSize, page*pageSize),[preview,page]);
+
+  // DB forms
+  const [pg,setPg]=useState({url:'',table:'',query:''});
+  const [sq,setSq]=useState({path:'',table:'',query:''});
+  const [bq,setBq]=useState({table:'',query:''});
+
+  // Predict/NLQ + model bits
+  const [question,setQuestion]=useState('');
+  const [modelMode,setModelMode]=useState<ModelMode>('auto');
+  const [manualModel,setManualModel]=useState('LogisticRegression');
+  const [target,setTarget]=useState<string>('');
+  const [modelId,setModelId]=useState<string>('');               // ref returned by training
+  const [metrics,setMetrics]=useState<{acc?:number;f1?:number;auc?:number}>({});
+  const [cm,setCm]=useState<number[][]|null>(null);
+  const [roc,setRoc]=useState<number[]|null>(null);
+  const [hist,setHist]=useState<number[]|null>(null);
+  const [drivers,setDrivers]=useState<{name:string,value:number}[]|null>(null);
+
+  useEffect(()=>{(async()=>{try{setDatasets(await fetchJSON('/api/data/sources')||[]);}catch{}})();},[]);
+  const demoOptions = useMemo(()=> (datasets||[]).map((d:any)=>({id:d.id||d.name||String(d),label:d.label||d.name||d.id||String(d)})),[datasets]);
+
+  // DEMO preview
+  useEffect(()=>{ if(!datasetId || datasetId.startsWith('local:') || datasetId.startsWith('db:')) return;
+    (async()=>{
+      setBusy('Loading preview…');
+      try{
+        const ds=(datasets||[]).find((d:any)=>(d.id||d.name||'')===datasetId)||{};
+        const tries=[{id:ds.id??datasetId,limit:200},{name:ds.name??datasetId,limit:200}];
+        let resp:any=null; for(const body of tries){ try{ resp=await postJSON('/api/data/preview',body); if(resp?.rows) break;}catch{} }
+        const rows=Array.isArray(resp?.rows)?resp.rows:[]; setPreview(rows); setColumns(rows[0]?Object.keys(rows[0]):[]); setPage(1);
+      } finally { setBusy(''); }
+    })();
+  },[datasetId,datasets]);
+
+  // CSV upload
+  async function uploadCSV(file:File){
+    setBusy('Parsing CSV…');
+    const parsed=parseCSV(await file.text()); setPreview(parsed.rows); setColumns(parsed.columns); setPage(1);
+    setDatasetId(`local:${file.name}`);
+    setBusy('Uploading CSV…'); try{ const fd=new FormData(); fd.append('file',file); await fetch('/api/data/upload',{method:'POST',body:fd}); } finally { setBusy(''); }
+  }
+
+  // DB preview
+  async function previewDB(provider:string,payload:any){
+    setBusy(`Connecting to ${provider}…`);
+    try{
+      const res=await postJSON('/api/data/db/preview',{provider,...payload,limit:200});
+      const rows=Array.isArray(res?.rows)?res.rows:[]; setPreview(rows); setColumns(rows[0]?Object.keys(rows[0]):[]); setDatasetId(`db:${provider}:${payload?.table|| (payload?.query?'query':'')}`); setPage(1);
+    } finally { setBusy(''); }
+  }
+
+  /* ---------- Predict: NLQ → AutoML → Train → Metrics ---------- */
+  async function askAuto(){
+    if(!preview.length || !columns.length) return;
+    setBusy('Understanding question…');
+    try{
+      // 1) NLQ → pick target
+      const n = await postJSON('/api/nlq',{question, columns});
+      const t = (n?.target || target || columns[columns.length-1]);
+      setTarget(t);
+
+      // 2) choose model (auto or manual)
+      let chosen = manualModel;
+      if(modelMode==='auto'){
+        setBusy('Recommending model…');
+        const rec = await fetchJSON('/api/automl/recommend');
+        chosen = rec?.model || 'XGBoost';
+      }
+
+      // 3) train (always train on new target; server can cache if same)
+      setBusy(`Training ${chosen}…`);
+      const train = await postJSON('/api/automl/train',{rows:preview, target:t, model:chosen});
+      setModelId(train?.modelId || `${chosen}:${t}`);
+      setMetrics({acc:train?.metrics?.accuracy, f1:train?.metrics?.f1, auc:train?.metrics?.roc_auc});
+      setCm(train?.cm || train?.confusion || null);
+      setRoc(train?.roc || null);
+      setHist(train?.hist || null);
+      setDrivers(train?.drivers || train?.shap || null);
+
+      setBusy('');
+      setActiveStep(6);
+    }catch(e){ setBusy(''); console.error(e); }
+  }
+
+  return (
+    <main className="container">
+      {/* rail */}
+      <div style={{display:'flex',alignItems:'center',gap:12,padding:12,flexWrap:'wrap'}}>
+        <strong>Workflow:</strong>
+        <div className="segtabs">
+          {['1. Data','2. EDA','3. Fixes','4. NLQ','5. Model','6. Predict/Explain'].map((t,i)=>
+            <span key={t} className={`seg ${activeStep===i+1?'active':''}`}>{t}</span>)}
+        </div>
+        {busy && <div className="loading" style={{marginLeft:'auto'}}><span className="spinner" /> <span>{busy}</span></div>}
+      </div>
+
+      <div className="grid3-root">
+        {/* LEFT */}
+        <div className="col left-pane" style={{display:'grid',gap:12,alignContent:'start'}}>
+          <div className="card"><h2>Explainability</h2><div className="body">
+            {/* EDA narrative on Step 2; model summary can also show here after Step 6 via the same generator */}
+            <ExplainPanel rows={preview} columns={columns}/>
+          </div></div>
+
+          {/* Optional: your “Recommended” list here if you kept it */}
+
+          <div className="card"><h2>Summary</h2><div className="body">
+            <ul className="muted" style={{margin:0}}><li>{preview.length} rows • {columns.length} columns</li></ul>
+          </div></div>
+        </div>
+
+        {/* CENTER */}
+        <div className="col center-pane">
+          <div className="center-scroll" style={{display:'grid',gap:12}}>
+            {/* Step 2: EDA charts + preview */}
+            <div className="card">
+              <h2>2) EDA</h2>
+              <div className="body">{ preview.length
+                ? <EDACompact rows={preview} columns={columns}/>
+                : <div className="muted">Upload/select data to see EDA.</div> }
+              </div>
+            </div>
+
+            {/* Single table (scrolls) */}
+            <div className="card"><h2>Preview (15/pg)</h2>
+              <div className="body">
+                <div className="table-wrap">
+                  <table className="table">
+                    <thead><tr>{columns.map(c=><th key={c}>{c}</th>)}</tr></thead>
+                    <tbody>{pageRows.map((r,ri)=><tr key={ri}>{columns.map(c=><td key={c}>{String(r?.[c]??'')}</td>)}</tr>)}</tbody>
+                  </table>
+                </div>
+                <div style={{display:'flex',justifyContent:'space-between',marginTop:8}}>
+                  <div className="muted">Page {page} / {totalPages} · showing {pageRows.length} of {preview.length}</div>
+                  <div style={{display:'flex',gap:8}}>
+                    <button className="btn" onClick={()=>setPage(p=>Math.max(1,p-1))} disabled={page<=1}>‹ Prev</button>
+                    <button className="btn" onClick={()=>setPage(p=>Math.min(totalPages,p+1))} disabled={page>=totalPages}>Next ›</button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {
+            {/* Predict step NLQ lives here so user stays on this page */}
+            {activeStep>=4 && (
+              <div className="card">
+                <h2>Ask in Natural Language</h2>
+                <div className="body" style={{display:'grid',gap:8}}>
+                  <input
+                    className="input"
+                    placeholder="Which categories will trend negatively on CAPEX?"
+                    value={question}
+                    onChange={e=>setQuestion(e.target.value)}
+                  />
+                  <div style={{display:'flex',gap:8,flexWrap:'wrap', alignItems:'center'}}>
+                    <button className="btn" onClick={askAuto}>Ask (auto-trains)</button>
+                    <span className="muted" style={{marginLeft:8}}>Mode:</span>
+                    <div className="segtabs">
+                      <button
+                        className={`seg ${modelMode==='auto'?'active':''}`}
+                        onClick={()=>setModelMode('auto')}
+                      >AutoML</button>
+                      <button
+                        className={`seg ${modelMode==='manual'?'active':''}`}
+                        onClick={()=>setModelMode('manual')}
+                      >Manual override</button>
+                    </div>
+                  </div>
+
+                  {/* Manual model choices appear only on Step 5 */}
+                  {activeStep===5 && modelMode==='manual' && (
+                    <div style={{display:'grid',gap:8,gridTemplateColumns:'repeat(2,1fr)'}}>
+                      {['LogisticRegression','RandomForest','XGBoost','MLP','TabNet'].map(m=>(
+                        <button
+                          key={m}
+                          className="card"
+                          style={{textAlign:'left',padding:12,border:`2px solid ${manualModel===m?'#111827':'#e5e7eb'}`}}
+                          onClick={()=>setManualModel(m)}
+                        >
+                          <strong>{m}</strong>
+                          <div className="muted">
+                            {m==='LogisticRegression'?'Fast, interpretable baseline for binary targets.'
+                              : m==='RandomForest'?'Strong tabular baseline; handles nonlinearity.'
+                              : m==='XGBoost'?'State-of-the-art on many tabular tasks.'
+                              : m==='MLP'?'Simple deep learner for tabular; captures interactions.'
+                              : 'Attention-based deep learning for tabular data.'}
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+<div className="statusbar">
+              <div>Step {activeStep}: {activeStep<6?'EDA':'Predict/Explain'}</div>
+              <div style={{display:'flex',gap:8}}>
+                <button className="btn" onClick={()=>setActiveStep(s=>Math.max(1,s-1))}>Back</button>
+                <button className="btn" onClick={()=>setActiveStep(s=>Math.min(6,s+1))}>Next</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* RIGHT: metrics that refresh after Ask/Train */}
+        <div className="col right-pane" style={{display:'grid',gap:12,alignContent:'start'}}>
+          <div className="card"><h2>Data sources</h2>
+            <div className="body" style={{display:'grid',gap:8}}>
+              <div className="segtabs">
+                {(['DEMO','CSV','POSTGRES','SQLITE','BIGQUERY'] as SourceTab[]).map(t=>
+                  <button key={t} className={`seg ${sourceTab===t?'active':''}`} onClick={()=>setSourceTab(t)}>{t}</button>)}
+              </div>
+
+              {sourceTab==='DEMO' && (<div style={{display:'grid',gap:6}}>
+                <label className="muted">Dataset</label>
+                <select value={datasetId} onChange={e=>setDatasetId(e.target.value)}>
+                  <option value="" disabled>Select a dataset…</option>
+                  {demoOptions.map(o=><option key={o.id} value={o.id}>{o.label}</option>)}
+                </select>
+              </div>)}
+
+              {sourceTab==='CSV' && (<div style={{display:'grid',gap:6}}>
+                <label className="muted">Upload CSV</label>
+                <input type="file" accept=".csv" onChange={e=>{const f=e.target.files?.[0]; if(f) uploadCSV(f);}} />
+                <div className="muted">We parse locally so EDA shows instantly.</div>
+              </div>)}
+
+              {sourceTab==='POSTGRES' && (<div style={{display:'grid',gap:8}}>
+                <input className="input" placeholder="postgres://user:pass@host:5432/db" value={pg.url} onChange={e=>setPg({...pg,url:e.target.value})}/>
+                <input className="input" placeholder="schema.table (optional)" value={pg.table} onChange={e=>setPg({...pg,table:e.target.value})}/>
+                <textarea className="input" placeholder="SELECT * FROM schema.table LIMIT 200 (optional)" value={pg.query} onChange={e=>setPg({...pg,query:e.target.value})}/>
+                <button className="btn" onClick={()=>previewDB('postgres',{conn:pg.url,table:pg.table||undefined,query:pg.query||undefined})}>Preview</button>
+              </div>)}
+
+              {sourceTab==='SQLITE' && (<div style={{display:'grid',gap:8}}>
+                <input className="input" placeholder="/path/to/file.sqlite" value={sq.path} onChange={e=>setSq({...sq,path:e.target.value})}/>
+                <input className="input" placeholder="table (optional)" value={sq.table} onChange={e=>setSq({...sq,table:e.target.value})}/>
+                <textarea className="input" placeholder="SELECT * FROM table LIMIT 200 (optional)" value={sq.query} onChange={e=>setSq({...sq,query:e.target.value})}/>
+                <button className="btn" onClick={()=>previewDB('sqlite',{path:sq.path,table:sq.table||undefined,query:sq.query||undefined})}>Preview</button>
+              </div>)}
+
+              {sourceTab==='BIGQUERY' && (<div style={{display:'grid',gap:8}}>
+                <input className="input" placeholder="project.dataset.table" value={bq.table} onChange={e=>setBq({...bq,table:e.target.value})}/>
+                <textarea className="input" placeholder="SELECT * FROM `project.dataset.table` LIMIT 200 (optional)" value={bq.query} onChange={e=>setBq({...bq,query:e.target.value})}/>
+                <button className="btn" onClick={()=>previewDB('bigquery',{table:bq.table||undefined,query:bq.query||undefined})}>Preview</button>
+              </div>)}
+            </div>
+          </div>
+
+          <Card title="Confusion Matrix"><Confusion cm={cm}/></Card>
+          <Card title="ROC"><ROC points={roc}/></Card>
+          <Card title="Predicted probability distribution"><Hist bins={hist}/></Card>
+          <Card title="Top drivers"><Drivers pairs={drivers}/></Card>
+          <Card title="Training metrics"><div className="muted">{metrics?.acc!=null?`accuracy=${metrics.acc?.toFixed?.(3)}`:'Not available yet.'}{metrics?.f1!=null?`  •  f1=${metrics.f1?.toFixed?.(3)}`:''}{metrics?.auc!=null?`  •  auc=${metrics.auc?.toFixed?.(3)}`:''}</div></Card>
+        </div>
+      </div>
+    </main>
+  );
+}

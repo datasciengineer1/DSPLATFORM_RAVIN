@@ -1,0 +1,115 @@
+export const runtime = "nodejs";
+import { NextResponse } from "next/server";
+import fs from "fs";
+import path from "path";
+import { parse } from "csv-parse/sync";
+
+function loadRowsForDataset(id: string) {
+  const root = process.cwd();
+
+  // 1) Preferred: JSON snapshot created by upload step
+  const jsonPath = path.join(root, "data", "datasets", `${id}.json`);
+  if (fs.existsSync(jsonPath)) {
+    const raw = fs.readFileSync(jsonPath, "utf8");
+    const rows = JSON.parse(raw);
+    if (Array.isArray(rows) && rows.length) return rows;
+  }
+
+  // 2) Fallback: original CSV the user uploaded
+  const csvPath = path.join(root, "data", "uploads", `${id}.csv`);
+  if (fs.existsSync(csvPath)) {
+    const csv = fs.readFileSync(csvPath, "utf8");
+    const rows = parse(csv, { columns: true, skip_empty_lines: true });
+    if (Array.isArray(rows) && rows.length) return rows;
+  }
+
+  throw new Error(`Dataset "${id}" not found or empty.`);
+}
+
+function detectTaskAndTarget(question: string, rows: any[]) {
+  const q = (question || "").toLowerCase();
+
+  // Collect numeric columns
+  const colNames = Object.keys(rows[0] || {});
+  const numericCols = colNames.filter((c) => {
+    const vals = rows.slice(0, 50).map((r) => r[c]).filter((v) => v !== null && v !== undefined && v !== "");
+    if (!vals.length) return false;
+    const nums = vals.map((v) => Number(v));
+    return nums.every((n) => Number.isFinite(n));
+  });
+
+  // Try to guess target from question; otherwise fallback to first numeric
+  let target: string | null = null;
+  for (const c of numericCols) {
+    if (q.includes(c.toLowerCase())) { target = c; break; }
+  }
+  if (!target && numericCols.length) target = numericCols[0];
+
+  const isForecast = /forecast|next\s+\d+|predict\s+next/i.test(q);
+  const task = isForecast ? "forecast" : "regression";
+
+  return { task, target };
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json();
+    const datasetId = body?.datasetId || body?.dataset || body?.id;
+    const question = body?.question || "";
+
+    if (!datasetId) {
+      return NextResponse.json({ error: "No datasetId provided" }, { status: 400 });
+    }
+
+    const rows = loadRowsForDataset(String(datasetId));
+    if (!rows.length) {
+      return NextResponse.json({ error: `Dataset "${datasetId}" not found or empty.` }, { status: 400 });
+    }
+
+    const { task, target } = detectTaskAndTarget(question, rows);
+
+    if (!target) {
+      return NextResponse.json({ error: "No numeric target column found." }, { status: 400 });
+    }
+
+    // --- Tiny baseline forecast/regression just to return something structured ---
+    // (You can keep your existing logic here; this part is intentionally simple.)
+    const y = rows.map((r) => Number(r[target!])).filter((v) => Number.isFinite(v));
+    let series: any[] = [];
+    let rmse: number | null = null, mae: number | null = null;
+    let horizon = 2;
+
+    if (task === "forecast") {
+      const w = Math.min(6, Math.max(2, Math.floor(y.length / 6) || 2));
+      const ma: number[] = [];
+      for (let i = 0; i < y.length; i++) {
+        const s = Math.max(0, i - w + 1);
+        const chunk = y.slice(s, i + 1);
+        ma.push(chunk.reduce((a, b) => a + b, 0) / chunk.length);
+      }
+      // simple next steps = last moving average
+      const lastMA = ma[ma.length - 1] ?? (y.length ? y[y.length - 1] : 0);
+      series = [
+        ...y.map((v, i) => ({ x: i, actual: v })),
+        ...Array.from({ length: horizon }, (_, h) => ({ x: y.length + h, forecast: lastMA }))
+      ];
+    } else {
+      // regression baseline = mean predictor
+      const mean = y.reduce((a, b) => a + b, 0) / (y.length || 1);
+      series = y.map((v, i) => ({ x: i, actual: v, pred: mean }));
+      const se = y.reduce((a, v) => a + Math.pow(v - mean, 2), 0) / (y.length || 1);
+      rmse = Math.sqrt(se);
+      mae = y.reduce((a, v) => a + Math.abs(v - mean), 0) / (y.length || 1);
+    }
+
+    return NextResponse.json({
+      task,
+      labels: { title: `${task === "forecast" ? "Forecast" : "Prediction"} of ${target}`, target, horizon: task === "forecast" ? horizon : undefined },
+      metrics: { rmse, mae },
+      series,
+      explain: `### Summary for: ${question}\n\n**Task (hint):** ${task}  \n**Target:** ${target}\n`
+    });
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || "Predict failed" }, { status: 500 });
+  }
+}
