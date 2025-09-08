@@ -2,7 +2,6 @@ import { NextResponse } from "next/server";
 import { deleteByQuestion, readCache, writeCache } from "@/lib/cache";
 
 export async function GET(){ return NextResponse.json({ items: readCache() }); }
-
 export async function DELETE(req:Request){
   const { nlq, all=false } = await req.json();
   if(all){ writeCache([]); return NextResponse.json({ ok:true, cleared:"all" }); }
