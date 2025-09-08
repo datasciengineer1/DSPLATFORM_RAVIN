@@ -1,57 +1,152 @@
 "use client";
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import Link from "next/link";
-import { LeftPanel, RightPanel, PanelCard } from "../components/SidePanels";
+
+type AutoResp = { task:string; recommendedModel:string; reasons:string[]; options:string[] };
+
+function Card({title,subtitle,children}:{title:string;subtitle?:string;children:React.ReactNode}){
+  return <div className="rounded-2xl border border-zinc-200 dark:border-zinc-800 p-4 md:p-5 bg-[var(--surface)]">
+    <div className="mb-3"><h3 className="text-base md:text-lg font-semibold">{title}</h3>{subtitle?<p className="text-sm text-zinc-500">{subtitle}</p>:null}</div>
+    {children}
+  </div>;
+}
+function Button(props:any){return <button {...props} className={"px-3 py-1.5 text-sm rounded-md "+(props.className||"bg-blue-600 text-white hover:bg-blue-700")} />}
 
 export default function ModelPage(){
-  const datasetName = typeof window !== "undefined" ? sessionStorage.getItem("currentDatasetName") : null;
+  const [nlq,setNlq] = useState("");
+  const [mode,setMode] = useState<"auto"|"manual">("auto");
+  const [auto,setAuto] = useState<AutoResp|null>(null);
+  const [task,setTask] = useState("regression");
+  const [model,setModel] = useState("Linear Regression");
+  const [explain,setExplain] = useState<any|null>(null);
+  const [busy,setBusy]=useState(false);
 
-  const [mode, setMode] = useState<"automl"|"manual">("automl");
-  const [model, setModel] = useState("LinearRegression");
-  const [target, setTarget] = useState("Sales");
+  useEffect(()=>{
+    const url = new URL(window.location.href);
+    const q = url.searchParams.get("nlq");
+    if(q) setNlq(q);
+  },[]);
 
-  const explainList = [
-    mode === "automl" ? "AutoML will select the best model for the task." : `Manual override: ${model}`,
-    `Target variable: ${target}`
-  ];
-  const recommended = ["Proceed to Predict to train/validate."];
+  async function runAuto(){
+    setBusy(true); setAuto(null);
+    const r = await fetch("/api/model/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq, mode:"auto" })});
+    const j = await r.json(); setAuto(j);
+    setTask(j.task); setModel(j.recommendedModel);
+    setBusy(false);
+  }
+
+  async function runManual(){
+    setBusy(true); setAuto(null);
+    const r = await fetch("/api/model/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq, mode:"manual", manual:{ task, model } })});
+    const j = await r.json(); setAuto(j);
+    setBusy(false);
+  }
+
+  async function predictExplain(forceFresh=false){
+    setBusy(true); setExplain(null);
+    const r = await fetch("/api/nlq/query",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq, language:"auto", provider:"stub", weights:{dense:0.6,sparse:0.2,cross:0.2}, forceFresh })});
+    const j = await r.json(); setExplain(j); setBusy(false);
+  }
+
+  async function deleteCache(){
+    await fetch("/api/nlq/cache",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq })});
+    alert("Cache deleted for this NLQ (if existed).");
+  }
 
   return (
-    <main className="container mx-auto px-4 py-4">
-      <div className="grid grid-cols-12 gap-4">
-        <LeftPanel explainList={explainList} recommended={recommended} />
-        <div className="col-span-12 xl:col-span-6 space-y-4">
-          <PanelCard title="Step 5: Model">
-            <div className="space-y-4">
-              <div className="flex items-center gap-4">
-                <label className="inline-flex items-center gap-2">
-                  <input type="radio" checked={mode==="automl"} onChange={()=>setMode("automl")} />
-                  <span>AutoML (default)</span>
-                </label>
-                <label className="inline-flex items-center gap-2">
-                  <input type="radio" checked={mode==="manual"} onChange={()=>setMode("manual")} />
-                  <span>Manual</span>
-                </label>
-              </div>
-              {mode==="manual" && (
-                <div className="flex gap-2">
-                  <select className="border rounded-lg px-3 py-2" value={model} onChange={e=>setModel(e.target.value)}>
-                    <option>LinearRegression</option>
-                    <option>LogisticRegression</option>
-                    <option>RandomForest</option>
-                  </select>
-                  <input className="border rounded-lg px-3 py-2" value={target} onChange={e=>setTarget(e.target.value)} />
-                </div>
-              )}
-              <div className="flex justify-end gap-2">
-                <Link href="/nlq" className="px-3 py-1.5 rounded-lg border">Back</Link>
-                <Link href="/predict" className="px-3 py-1.5 rounded-lg bg-blue-600 text-white">Next</Link>
-              </div>
-            </div>
-          </PanelCard>
-        </div>
-        <RightPanel datasetName={datasetName} />
+    <main className="container mx-auto px-4 py-5 space-y-4">
+      <div className="flex items-center justify-between">
+        <h1 className="text-xl font-semibold">Model Selection — AutoML & Manual • Predict/Explain</h1>
+        <Link href="/nlq" className="px-3 py-1.5 rounded-md border">← NLQ</Link>
       </div>
+
+      <Card title="NLQ Context">
+        <div className="grid md:grid-cols-[1fr_auto_auto] items-start gap-3">
+          <textarea value={nlq} onChange={e=>setNlq(e.target.value)} placeholder="Paste/enter NLQ here"
+            className="w-full min-h-[72px] rounded-md border p-2" />
+          <Button onClick={()=>predictExplain(false)} disabled={!nlq || busy}>Predict/Explain</Button>
+          <Button onClick={()=>predictExplain(true)} className="bg-amber-600 text-white" disabled={!nlq || busy}>Regenerate (Ollama)</Button>
+        </div>
+        <div className="mt-2 flex gap-2">
+          <Button onClick={deleteCache} className="bg-transparent text-red-600 border border-red-600">Delete cache</Button>
+          <Link href={`/model?nlq=${encodeURIComponent(nlq)}`} className="px-3 py-1.5 text-sm rounded-md border">Refresh with NLQ</Link>
+        </div>
+      </Card>
+
+      <Card title="Selection Mode" subtitle="AutoML infers task & suggests an algorithm. Manual lets you choose.">
+        <div className="flex gap-2 mb-3">
+          <Button onClick={()=>setMode("auto")} className={mode==="auto"?"bg-zinc-900 text-white":"bg-transparent border"}>AutoML (Default)</Button>
+          <Button onClick={()=>setMode("manual")} className={mode==="manual"?"bg-zinc-900 text-white":"bg-transparent border"}>Manual</Button>
+        </div>
+
+        {mode==="auto" ? (
+          <div className="space-y-3">
+            <Button onClick={runAuto} disabled={!nlq || busy}>Run AutoML Selection</Button>
+            {auto && (
+              <div className="rounded-lg border p-3 text-sm">
+                <div><b>Task:</b> {auto.task}</div>
+                <div><b>Recommended:</b> {auto.recommendedModel}</div>
+                <div className="mt-2"><b>Why:</b>
+                  <ul className="list-disc ml-5">{auto.reasons.map((r,i)=><li key={i}>{r}</li>)}</ul>
+                </div>
+                <div className="mt-2"><b>Other options:</b> {auto.options.join(" · ")}</div>
+              </div>
+            )}
+          </div>
+        ) : (
+          <div className="grid md:grid-cols-3 gap-3">
+            <label className="grid gap-1 text-sm">
+              <span className="text-zinc-500">Problem type</span>
+              <select value={task} onChange={e=>setTask(e.target.value)} className="border rounded-md px-2 py-1.5">
+                <option value="regression">Regression</option>
+                <option value="classification">Classification</option>
+                <option value="forecasting">Forecasting</option>
+                <option value="clustering">Clustering</option>
+              </select>
+            </label>
+            <label className="grid gap-1 text-sm">
+              <span className="text-zinc-500">Model</span>
+              <select value={model} onChange={e=>setModel(e.target.value)} className="border rounded-md px-2 py-1.5">
+                {task==="regression" && ["Linear Regression","Ridge","Lasso","Random Forest Regressor","XGBoost Regressor","CatBoost Regressor"].map(m=><option key={m}>{m}</option>)}
+                {task==="classification" && ["Logistic Regression","Random Forest Classifier","XGBoost Classifier","CatBoost Classifier"].map(m=><option key={m}>{m}</option>)}
+                {task==="forecasting" && ["Moving Average","ARIMA","SARIMA","Prophet"].map(m=><option key={m}>{m}</option>)}
+                {task==="clustering" && ["KMeans","DBSCAN","HDBSCAN"].map(m=><option key={m}>{m}</option>)}
+              </select>
+            </label>
+            <div className="flex items-end"><Button onClick={runManual} disabled={!nlq || busy}>Select</Button></div>
+          </div>
+        )}
+      </Card>
+
+      {explain && (
+        <>
+          <Card title={"Predict/Explain — " + (explain.fromCache?"From Cache":"Fresh")}>
+            <div className="prose prose-sm max-w-none whitespace-pre-wrap">{explain.explanation}</div>
+          </Card>
+          <Card title="Cross-encoder & Retrieval Scores" subtitle="What each score means">
+            <p className="text-sm text-zinc-600 mb-2">
+              <b>Cosine:</b> similarity between dense embeddings (higher ≈ more semantically similar).{" "}
+              <b>Sparse:</b> lexical overlap/BM25-like (higher ≈ more shared keywords/phrases).{" "}
+              <b>Cross:</b> re-rank model reads the query & candidate together and outputs a relevance score (0–1).
+            </p>
+            <div className="overflow-auto">
+              <table className="min-w-full text-sm">
+                <thead><tr className="text-left"><th className="px-2 py-1">Candidate</th><th className="px-2 py-1">Cosine</th><th className="px-2 py-1">Sparse</th><th className="px-2 py-1">Cross</th></tr></thead>
+                <tbody>
+                  {explain.retrieval?.hits?.map((h:any,i:number)=>(
+                    <tr key={i} className="border-t">
+                      <td className="px-2 py-1">{h.question}</td>
+                      <td className="px-2 py-1">{h.cosine.toFixed(3)}</td>
+                      <td className="px-2 py-1">{h.sparse.toFixed(3)}</td>
+                      <td className="px-2 py-1">{h.rerank.toFixed(3)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Card>
+        </>
+      )}
     </main>
   );
 }
