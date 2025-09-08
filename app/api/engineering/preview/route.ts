@@ -1,71 +1,27 @@
 import { NextResponse } from "next/server";
-import { loadDatasetSync } from "@/utils/datasets";
-
-type Body = {
-  datasetId: string;
-  impute?: { strategy: "mean" | "median" | "mode" };
-  onehot?: string[]; // categorical columns
-  limit?: number;
-};
-
-function isNum(x: any) { return typeof x === "number" && Number.isFinite(x); }
-
-function imputeCol(values: any[], how: "mean"|"median"|"mode") {
-  const clean = values.filter(isNum) as number[];
-  if (!clean.length) return values.map(v => (v == null ? 0 : v));
-  if (how === "mean") {
-    const m = clean.reduce((a,c)=>a+c,0)/clean.length;
-    return values.map(v => (v == null ? m : v));
-  }
-  if (how === "median") {
-    const s = [...clean].sort((a,b)=>a-b);
-    const m = s[Math.floor(s.length/2)];
-    return values.map(v => (v == null ? m : v));
-  }
-  // mode
-  const freq = new Map<number, number>();
-  for (const n of clean) freq.set(n, (freq.get(n)||0)+1);
-  const mode = [...freq.entries()].sort((a,b)=>b[1]-a[1])[0][0];
-  return values.map(v => (v == null ? mode : v));
-}
 
 export async function POST(req: Request) {
-  const body = await req.json() as Body;
-  const { datasetId, impute, onehot = [], limit = 100 } = body || {};
-  if (!datasetId) return NextResponse.json({ error: "datasetId required" }, { status: 400 });
+  const { task, payload } = await req.json();
 
-  const ds = loadDatasetSync(datasetId);
-  const rows: any[] = ds.rows || ds.data || [];
-  if (!rows.length) return NextResponse.json({ rows: [], columns: [] });
-
-  // impute numeric
-  let out = [...rows];
-  if (impute) {
-    const keys = Object.keys(out[0] || {});
-    for (const k of keys) {
-      const col = out.map(r => r?.[k]);
-      if (col.some(isNum)) {
-        const filled = imputeCol(col, impute.strategy);
-        out = out.map((r, i) => ({ ...r, [k]: filled[i] }));
-      }
+  const summary = (() => {
+    switch (task) {
+      case "impute": return `Would impute ${payload.cols || "(no cols)"} using ${payload.method}${payload.method==="Constant" ? `=${payload.constant ?? 0}`: ""}.`;
+      case "skew": return `Would compute skew on ${payload.cols || "(no cols)"} with ${payload.det}.`;
+      case "log1p": return `Would apply log1p to ${payload.cols || "(no cols)"} ${payload.only==="Yes" ? "if right-skewed" : ""}.`;
+      case "outliers": return `Would detect outliers in ${payload.cols || "(no cols)"} via ${payload.method}; treatment=${payload.treatment}.`;
+      case "clip": return `Would clip ${payload.cols || "(no cols)"} to [${payload.min ?? "-∞"}, ${payload.max ?? "+∞"}].`;
+      case "dedupe": return `Would drop duplicates keep=${payload.keep} subset=${payload.subset || "(all)"}.`;
+      case "scaling": return `Would scale ${payload.cols || "(no cols)"} using ${payload.method}${payload.method.includes("Min-Max") ? ` range ${payload.range}`:""}.`;
+      case "formula": return `Would create ${Array.isArray(payload.formulas)?payload.formulas.length:0} derived feature(s).`;
+      case "target": return `Would set target=${payload.target} type=${payload.ptype} split=${payload.split}.`;
+      case "encoding": return `Would encode ${payload.cols || "(no cols)"} using ${payload.method}.`;
+      case "binning": return `Would bin ${payload.column} into ${payload.bins} bins (${payload.strategy}).`;
+      case "interactions": return `Would create interaction ${payload.a} × ${payload.b} -> ${payload.out}.`;
+      case "dateparts": return `Would extract ${Array.isArray(payload.parts)?payload.parts.join(", "):payload.parts} from ${payload.column} tz=${payload.tz}.`;
+      case "polynomial": return `Would expand ${payload.cols || "(no cols)"} to degree ${payload.deg} interactions=${payload.interactions}.`;
+      default: return `Unknown task "${task}".`;
     }
-  }
+  })();
 
-  // one-hot
-  if (onehot.length) {
-    out = out.map(r => {
-      let rr = { ...r };
-      for (const col of onehot) {
-        const val = r?.[col];
-        if (val != null) {
-          rr[`${col}__${String(val)}`] = 1;
-        }
-        delete (rr as any)[col];
-      }
-      return rr;
-    });
-  }
-
-  const preview = out.slice(0, limit);
-  return NextResponse.json({ columns: Object.keys(preview[0] || {}), preview });
+  return NextResponse.json({ ok: true, task, summary, echo: payload }, { status: 200 });
 }
