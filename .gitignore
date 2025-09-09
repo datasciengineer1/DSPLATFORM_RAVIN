@@ -10,3 +10,6 @@ dist
 *_bak*
 .git_backup*
 data/*.tmp
+node_modules/
+.next/
+.venv*

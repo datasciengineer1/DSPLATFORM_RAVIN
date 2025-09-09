@@ -4,6 +4,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from FlagEmbedding import BGEM3FlagModel
 from sentence_transformers import CrossEncoder
+from fastapi.responses import JSONResponse
+from .jsonify import to_py
+
 
 app = FastAPI(title="IR Local", version="1.0")
 
@@ -30,7 +33,7 @@ def embed(inp: EmbedIn):
     # lexical weights is a list of dicts: [{token: weight, ...}, ...]
     sparse = out.get("lexical_weights", out.get("sparse_vecs", []))
     colbert = [v.tolist() for v in out.get("colbert_vecs", [])]
-    return {"dense": dense, "sparse": sparse, "colbert": colbert}
+    return JSONResponse({"dense": to_py(dense), "sparse": to_py(sparse), "colbert": to_py(colbert)})
 
 class RerankIn(BaseModel):
     query: str
@@ -40,4 +43,4 @@ class RerankIn(BaseModel):
 def rerank(inp: RerankIn):
     pairs = [(inp.query, c) for c in inp.candidates]
     scores = reranker.predict(pairs).tolist()  # higher = more relevant
-    return {"scores": scores}
+    return JSONResponse({"scores": to_py(scores)})

@@ -1,6 +1,7 @@
 "use client";
 import React, { useEffect, useState } from "react";
 import Link from "next/link";
+import SparkBars from "@/components/SparkBars";
 
 type AutoResp = { task:string; recommendedModel:string; reasons:string[]; options:string[] };
 
@@ -24,7 +25,15 @@ export default function ModelPage(){
   useEffect(()=>{
     const url = new URL(window.location.href);
     const q = url.searchParams.get("nlq");
+    const runAuto = url.searchParams.get("auto")==="1";
     if(q) setNlq(q);
+    if (runAuto && q) {
+      (async()=>{
+        await new Promise(r=>setTimeout(r,50));
+        await fetch("/api/model/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq:q, mode:"auto" })}).then(r=>r.json()).then(setAuto);
+        await fetch("/api/nlq/query",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq:q, language:"auto", provider:"stub", weights:{dense:0.6,sparse:0.2,cross:0.2}, forceFresh:false })}).then(r=>r.json()).then(setExplain);
+      })();
+    }
   },[]);
 
   async function runAuto(){
@@ -34,24 +43,25 @@ export default function ModelPage(){
     setTask(j.task); setModel(j.recommendedModel);
     setBusy(false);
   }
-
   async function runManual(){
     setBusy(true); setAuto(null);
     const r = await fetch("/api/model/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq, mode:"manual", manual:{ task, model } })});
-    const j = await r.json(); setAuto(j);
-    setBusy(false);
+    const j = await r.json(); setAuto(j); setBusy(false);
   }
-
   async function predictExplain(forceFresh=false){
     setBusy(true); setExplain(null);
     const r = await fetch("/api/nlq/query",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq, language:"auto", provider:"stub", weights:{dense:0.6,sparse:0.2,cross:0.2}, forceFresh })});
     const j = await r.json(); setExplain(j); setBusy(false);
   }
-
   async function deleteCache(){
     await fetch("/api/nlq/cache",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({ nlq })});
     alert("Cache deleted for this NLQ (if existed).");
   }
+
+  const top = explain?.retrieval?.hits?.[0];
+  const denseC = top?.contributions?.dense ?? (top?.cosine ?? 0);
+  const sparseC= top?.contributions?.sparse ?? (top?.sparse ?? 0);
+  const crossC = top?.contributions?.cross ?? (top?.rerank ?? 0);
 
   return (
     <main className="container mx-auto px-4 py-5 space-y-4">
@@ -123,22 +133,33 @@ export default function ModelPage(){
           <Card title={"Predict/Explain — " + (explain.fromCache?"From Cache":"Fresh")}>
             <div className="prose prose-sm max-w-none whitespace-pre-wrap">{explain.explanation}</div>
           </Card>
-          <Card title="Cross-encoder & Retrieval Scores" subtitle="What each score means">
-            <p className="text-sm text-zinc-600 mb-2">
-              <b>Cosine:</b> similarity between dense embeddings (higher ≈ more semantically similar).{" "}
-              <b>Sparse:</b> lexical overlap/BM25-like (higher ≈ more shared keywords/phrases).{" "}
-              <b>Cross:</b> re-rank model reads the query & candidate together and outputs a relevance score (0–1).
-            </p>
+
+          <Card title="Retrieval Weights & Contributions" subtitle={explain?.retrieval?.formula || "Normalized weights and top-hit contributions"}>
+            {explain?.retrieval?.normWeights && (
+              <div className="text-sm mb-2">
+                <b>Normalized weights:</b>{" "}
+                dense {explain.retrieval.normWeights.dense.toFixed(2)},{" "}
+                sparse {explain.retrieval.normWeights.sparse.toFixed(2)},{" "}
+                cross {explain.retrieval.normWeights.cross.toFixed(2)}
+              </div>
+            )}
+            {top && (
+              <div className="mb-3">
+                <div className="text-xs text-zinc-500 mb-1">Top candidate contributions</div>
+                <SparkBars dense={denseC} sparse={sparseC} cross={crossC} />
+              </div>
+            )}
             <div className="overflow-auto">
               <table className="min-w-full text-sm">
-                <thead><tr className="text-left"><th className="px-2 py-1">Candidate</th><th className="px-2 py-1">Cosine</th><th className="px-2 py-1">Sparse</th><th className="px-2 py-1">Cross</th></tr></thead>
+                <thead><tr className="text-left"><th className="px-2 py-1">Candidate</th><th className="px-2 py-1">Cos</th><th className="px-2 py-1">Sparse</th><th className="px-2 py-1">Cross</th><th className="px-2 py-1">Combined</th></tr></thead>
                 <tbody>
                   {explain.retrieval?.hits?.map((h:any,i:number)=>(
                     <tr key={i} className="border-t">
                       <td className="px-2 py-1">{h.question}</td>
-                      <td className="px-2 py-1">{h.cosine.toFixed(3)}</td>
-                      <td className="px-2 py-1">{h.sparse.toFixed(3)}</td>
-                      <td className="px-2 py-1">{h.rerank.toFixed(3)}</td>
+                      <td className="px-2 py-1">{(h.contributions?.dense ?? h.cosine).toFixed(3)}</td>
+                      <td className="px-2 py-1">{(h.contributions?.sparse ?? h.sparse).toFixed(3)}</td>
+                      <td className="px-2 py-1">{(h.contributions?.cross  ?? h.rerank).toFixed(3)}</td>
+                      <td className="px-2 py-1">{(h.contributions?.combined ?? 0).toFixed(3)}</td>
                     </tr>
                   ))}
                 </tbody>

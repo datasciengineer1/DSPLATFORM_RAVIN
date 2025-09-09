@@ -378,8 +378,6 @@ function Log1pPanel({ prefill, onPreview, onApply }:{ prefill?: any; onPreview:(
 }
 function OutliersPanel({ prefill, onPreview, onApply }:{ prefill?: any; onPreview:(t:TaskId,p:any)=>void; onApply:(t:TaskId,p:any)=>void }) {
   const [cols, setCols] = useState(prefill?.cols || "");
-  the past, the explanation should be retrieved from the Cache. Additionally, as delete cache option should be provided in case I want to re-run the explanation. I would also want to see cross encoder details like relevance scores, details of re-ranking and retrieval relevance scores with clear english explanation explaining what each score means.
-  const [method, setMethod] = useState(prefill?.method || "IQR (k=1.5)");
   const [treatment, setTreatment] = useState(prefill?.treatment || "Cap to bounds");
   return (
     <Card title="Outliers" subtitle="Detect & treat outliers by IQR or Z-score.">
