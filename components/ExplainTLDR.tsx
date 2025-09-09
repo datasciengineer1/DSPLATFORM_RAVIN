@@ -1,9 +1,6 @@
 "use client";
 import React from "react";
-
-export default function ExplainTLDR({ what, why, how }:{
-  what?: string; why?: string; how?: string[] | undefined;
-}){
+export default function ExplainTLDR({ what, why, how }:{ what?: string; why?: string; how?: string[]|undefined }){
   const howLine = (how && how.length) ? how.slice(0,2).join(" • ") : "—";
   return (
     <div className="overflow-auto">

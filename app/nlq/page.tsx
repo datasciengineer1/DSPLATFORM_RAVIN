@@ -174,7 +174,9 @@ export default function NLQPage(){
             </div>
           </Card>
           <CompactRetrieval r={res?.retrieval} />
-        </aside>
+        
+  <CompactRetrieval r={res?.retrieval} />
+</aside>
 
         {/* CENTER */}
         <section className="col-span-12 lg:col-span-6 space-y-4">
