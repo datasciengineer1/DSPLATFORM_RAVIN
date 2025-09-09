@@ -11,6 +11,7 @@ import Spinner from "@/components/Spinner";
 import VoiceButton from "@/components/VoiceButton";
 import TabStrip from "@/components/TabStrip";
 import TldrSummary from "@/components/TldrSummary";
+import ImpactChips from "@/components/ImpactChips";
 import HitList from "@/components/HitList";
 import VoiceLoop from "@/components/VoiceLoop";
 import ResultSkeleton from "@/components/ResultSkeleton";
@@ -179,7 +180,7 @@ export default function NLQPage(){
   const [rview,setRview]=useState<"Compact"|"Table">("Compact");
   const tldr = useMemo(()=> extractTLDR(res?.explanation || ""), [res?.explanation]);
   const speakText = useMemo(() => {
-    const parts = [tldr.what, tldr.why].filter(Boolean);
+  const confidence = useMemo(() => { const v = res?.retrieval?.combinedTop ?? 0; if (v >= 0.75) return {label:"High", cls:"bg-emerald-500\/15 text-emerald-400 border border-emerald-500\/20"}; if (v >= 0.5) return {label:"Medium", cls:"bg-amber-500\/15 text-amber-400 border border-amber-500\/20"}; return {label:"Low", cls:"bg-zinc-500\/15 text-zinc-400 border border-zinc-500\/20"}; }, [res?.retrieval?.combinedTop]);    const parts = [tldr.what, tldr.why].filter(Boolean);
     return parts.length ? parts.join(". ") : "";
   }, [tldr.what, tldr.why]);
 
@@ -273,7 +274,7 @@ export default function NLQPage(){
           </Card>
 
           <Card
-            title={<span className="flex items-center gap-3">Results <TabStrip tabs={["Explanation","Retrieval","Raw"]} value={tab} onChange={v=>setTab(v as any)} /></span>}
+            title={<span className="flex items-center gap-3">Results {res ? <span className={"px-2 py-0.5 rounded-full text-xs "+confidence.cls}>{confidence.label} confidence</span> : null} <TabStrip tabs={["Explanation","Retrieval","Raw"]} value={tab} onChange={v=>setTab(v as any)} /></span>}
             subtitle={tab==="Explanation" ? "Structured Markdown answer" : tab==="Retrieval" ? "Top candidates & scores" : "Raw API (debug)"}
           >
             {tab==="Explanation" && (

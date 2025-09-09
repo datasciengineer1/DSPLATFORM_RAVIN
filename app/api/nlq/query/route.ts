@@ -128,6 +128,8 @@ export async function POST(req:Request){
       deepMd = `## What it means\nWe generated a preliminary explanation from similar questions.\n\n## Why\n${list}\n\n## How to analyze\n- Validate columns and drivers.\n- Plot seasonality and outliers.\n\n## Strategies\n- Control costs / optimize mix; add seasonal components for forecasting.\n\n## Assumptions & limits\nHeuristic fallback used.\n\n## Next best questions\n- Drill down by top categories.\n- Show seasonality strength.\n- Explain outliers and drivers.`;
     }
 
+    deepMd = ensureImpactTable(deepMd, nlq);
+
     // 2) Condense if needed
     let finalMd = deepMd;
     if((["standard","short"] as Detail[]).includes(detail)){
@@ -161,4 +163,79 @@ export async function POST(req:Request){
     console.error("NLQ route error:",err);
     return NextResponse.json({ok:false,error:String(err?.message||err)},{status:502});
   }
+}
+
+// ---- Repair step: ensure "KPI impact (structured)" exists ----
+function ensureImpactTable(md: string, nlq: string): string {
+  try {
+    // If a KPI table already exists, keep as-is
+    if (/\|\s*KPI\s*\|\s*Direction/i.test(md)) return md;
+
+    const text = md || "";
+    const kpis = [
+      "profit margin", "margin", "revenue", "cogs", "cost of goods sold",
+      "churn", "conversion", "units", "arpu"
+    ];
+
+    type Row = { kpi:string; dir:"up"|"down"|"flat"; mag:"low"|"med"|"high"; why:string };
+    const rows: Row[] = [];
+
+    const dirOf = (s:string): "up"|"down"|"flat" => {
+      const t = s.toLowerCase();
+      if (/(increase|increasing|up|rise|rising|higher|growth|improv)/.test(t)) return "up";
+      if (/(decrease|decreasing|down|fall|lower|drop|declin)/.test(t)) return "down";
+      return "flat";
+    };
+    const magOf = (s:string): "low"|"med"|"high" => {
+      const t = s.toLowerCase();
+      if (/(significant|substantial|large|strong|sharp|high)/.test(t)) return "high";
+      if (/(slight|small|minor|low|modest)/.test(t)) return "low";
+      return "med";
+    };
+
+    for (const k of kpis) {
+      const safe = k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(`([\\s\\S]{0,160})${safe}([\\s\\S]{0,160})`, "i");
+      const m = text.match(re);
+      if (m) {
+        const seg = (m[1] + k + m[2]);
+        const dir = dirOf(seg);
+        const mag = magOf(seg);
+        const whyMatch = seg.match(/(?:because|due to|driven by|as (?:a )?result of|from)\s+([^.;:]+)[.;:]?/i);
+        const why = whyMatch ? whyMatch[0].trim() : "";
+        rows.push({ kpi:k, dir, mag, why });
+      }
+    }
+
+    // Fallback rows if nothing detected
+    const uniq = (list: Row[]) => {
+      const seen = new Set<string>(); const out: Row[] = [];
+      for (const r of list) {
+        const key = r.kpi.toLowerCase().replace(/\s+/g, " ");
+        if (seen.has(key)) continue; seen.add(key); out.push(r);
+      }
+      return out;
+    };
+
+    const finalRows = uniq(rows).slice(0, 6);
+    const lines = finalRows.length
+      ? finalRows.map(r => `| ${titleCase(r.kpi)} | ${r.dir} | ${r.mag} | ${r.why || "—"} |`).join("\n")
+      : [
+          "| Profit margin | flat | low | Not enough signal yet. |",
+          "| Revenue | flat | low | Pending analysis. |",
+          "| COGS | flat | low | Pending analysis. |",
+        ].join("\n");
+
+    const table = `### KPI impact (structured)
+| KPI | Direction (up/down/flat) | Magnitude (low/med/high) | Why |
+|---|---|---|---|
+${lines}
+
+`;
+    return table + md;
+  } catch {
+    return md;
+  }
+
+  function titleCase(s:string){ return s.replace(/\b\w/g, c => c.toUpperCase()); }
 }
