@@ -13,3 +13,9 @@ data/*.tmp
 node_modules/
 .next/
 .venv*
+# build / deps
+node_modules/
+.next/
+dist/
+.env*
+.DS_Store
