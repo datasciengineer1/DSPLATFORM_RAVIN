@@ -186,6 +186,11 @@ export default function NLQPage(){
             subtitle="Type or dictate your question, pick detail; click Ask."
             right={<div className="text-xs text-zinc-500">{interactive ? "Interactive mode (beta)" : ""}</div>}
           >
+      <div className="mb-2 flex justify-end">
+        <div className="w-56">
+          <LanguageSelect value={lang} onChange={setLang} />
+        </div>
+      </div>
             <textarea value={nlq} onChange={e=>setNlq(e.target.value)} placeholder="e.g., Forecast revenue for next 12 weeks by category"
               className="w-full min-h-[120px] rounded-md border p-2" />
             <div className="mt-3 flex items-center gap-2 flex-wrap">
