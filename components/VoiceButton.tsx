@@ -1,84 +1,70 @@
+// components/VoiceButton.tsx
 "use client";
-import React from "react";
+import React, {useEffect, useRef, useState} from "react";
 
-type Props = {
-  lang?: string;                 // e.g., "en-US", "hi-IN"
-  onResult: (text: string) => void;
-  interim?: boolean;             // show interim results (default true)
-  continuous?: boolean;          // default false
-  className?: string;
-};
+export default function VoiceButton(
+  { onFinal, autoLanguage="auto-detect", disabled=false }:
+  { onFinal:(t:string)=>void; autoLanguage?:string; disabled?:boolean }
+){
+  const [listening,setListening]=useState(false);
+  const recRef = useRef<any>(null);
+  const bufRef = useRef<string>("");
+  const timerRef = useRef<any>(null);
+  const lastRef = useRef<string>("");
 
-export default function VoiceButton({
-  lang,
-  onResult,
-  interim = true,
-  continuous = false,
-  className = "",
-}: Props) {
-  const [supported, setSupported] = React.useState(false);
-  const [listening, setListening] = React.useState(false);
-  const recogRef = React.useRef<any>(null);
-
-  React.useEffect(() => {
-    if (typeof window === "undefined") return;
-    const SR: any = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
-    if (SR) {
-      const r = new SR();
-      r.continuous = continuous;
-      r.interimResults = interim;
-      r.lang = lang || "en-US";
-      recogRef.current = r;
-      setSupported(true);
-    } else {
-      setSupported(false);
-    }
-    return () => { try { recogRef.current?.stop?.(); } catch {} };
-  }, [lang, interim, continuous]);
-
-  const start = React.useCallback(() => {
-    const r = recogRef.current;
-    if (!r) return;
-    let finalText = "";
-    r.lang = lang || "en-US";
-    r.onresult = (e: any) => {
-      for (let i = e.resultIndex; i < e.results.length; ++i) {
-        const t = e.results[i][0]?.transcript || "";
-        if (e.results[i].isFinal) finalText += t;
+  useEffect(()=>{
+    // Browser guard
+    const SR:any = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
+    if(!SR) return;
+    const r = new SR();
+    r.interimResults = true;
+    r.continuous = true;
+    r.lang = autoLanguage==="auto-detect" ? undefined : autoLanguage;
+    r.onresult = (ev:any)=>{
+      let interim = "";
+      for(let i=ev.resultIndex;i<ev.results.length;i++){
+        const res = ev.results[i];
+        const t = res[0].transcript;
+        if(res.isFinal){
+          bufRef.current += (t.endsWith(".")? t : t+" ");
+        } else {
+          interim += t + " ";
+        }
       }
-      if (finalText.trim().length) onResult(finalText.trim());
+      // simple dedupe of repeating prefixes
+      const clean = (bufRef.current + " " + interim).replace(/\b(\w+)( \1\b)+/gi,"$1");
+      lastRef.current = clean.trim();
+
+      if(timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(()=>{
+        const finalT = lastRef.current.trim();
+        if(finalT){
+          onFinal(finalT);
+          bufRef.current = "";
+          lastRef.current = "";
+        }
+        try{ r.stop(); }catch{}
+        setListening(false);
+      }, 2000); // 2s silence
     };
-    r.onerror = () => setListening(false);
-    r.onend = () => setListening(false);
-    setListening(true);
-    r.start();
-  }, [lang, onResult]);
+    r.onerror = ()=>{ setListening(false); };
+    recRef.current = r;
+    return ()=>{ try{ r.stop(); }catch{} };
+  },[autoLanguage, onFinal]);
 
-  const stop = React.useCallback(() => {
-    try { recogRef.current?.stop?.(); } finally { setListening(false); }
-  }, []);
-
-  const toggle = () => (listening ? stop() : start());
-
-  const tip = supported
-    ? (listening ? "Listening… click to stop" : "Use your mic to fill the question")
-    : "Voice dictation needs Chrome/Edge (Web Speech API).";
+  const toggle = ()=>{
+    if(disabled) return;
+    const r = recRef.current;
+    if(!r) return;
+    if(listening){ try{ r.stop(); }catch{} setListening(false); return; }
+    bufRef.current = ""; lastRef.current = "";
+    try{ r.start(); setListening(true); }catch{}
+  };
 
   return (
-    <button
-      type="button"
-      onClick={toggle}
-      disabled={!supported}
-      title={tip}
-      className={
-        "inline-flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm " +
-        (supported ? "hover:bg-zinc-50 dark:hover:bg-zinc-900/50 " : "opacity-60 cursor-not-allowed ") +
-        className
-      }
-    >
-      <span aria-hidden>🎙️</span>
-      <span>{listening ? "Stop" : "Voice"}</span>
-      {listening && <span className="ml-1 inline-block w-2 h-2 rounded-full bg-red-500" aria-hidden />}
+    <button type="button" onClick={toggle} disabled={disabled}
+      className={`px-3 py-1 rounded-md border ${listening?'bg-blue-600 text-white border-blue-500':'bg-zinc-900 border-zinc-700'}`}>
+      {listening? "Listening…" : "Voice"}
     </button>
   );
 }

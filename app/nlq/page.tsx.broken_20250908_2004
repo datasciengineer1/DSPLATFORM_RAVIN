@@ -189,7 +189,7 @@ export default function NLQPage(){
                 className="w-full min-h-[96px] rounded-md border p-2"
               />
               <div className="flex flex-wrap items-center gap-2">
-                <VoiceButton lang={useMemo(()=> lang==="auto" ? detectLangFromText(nlq) : lang,[lang,nlq])} onResult={t=>setNlq(t)} />
+                <VoiceButton lang={useMemo(()=> lang==="auto" ? detectLangFromText(nlq) : lang,[lang,nlq])} onFinal={t=>setNlq(t)} />
                 <Button onClick={()=>ask(false)} disabled={!combinedOk || busy}>
                   {busy ? <span className="inline-flex items-center gap-2"><Spinner size={14}/><span>Asking…</span></span> : "Ask"}
                 </Button>

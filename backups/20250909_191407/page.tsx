@@ -189,7 +189,9 @@ export default function NLQPage(){
             <textarea value={nlq} onChange={e=>setNlq(e.target.value)} placeholder="e.g., Forecast revenue for next 12 weeks by category"
               className="w-full min-h-[120px] rounded-md border p-2" />
             <div className="mt-3 flex items-center gap-2 flex-wrap">
-              <VoiceButton onFinal={setNlq} autoLanguage={lang==="auto"?"auto-detect":lang} disabled={busy} />setNlq(t)}
+              <VoiceButton
+  autoLanguage={lang==="auto"?"auto-detect":lang}
+  onResult={(t)=>setNlq(t)}
   onFinal={(t)=>{ setNlq(t); ask(false); }}
   disabled={busy}
 />
@@ -222,16 +224,6 @@ setNlq(t)} disabled={busy} />
           <Card title="Results" subtitle="Structured Markdown answer">
             <ExplainHeader category={res?.explainStruct?.category} confidence={res?.explainStruct?.confidence} />
 {hasKpi ? <KpiImpactTable rows={res!.explainStruct!.kpi_impact!} /> : null}
-          {/* Business narrative from the structured KPI impact */}
-          <ExplainBizNarrative impacts={res?.explainStruct?.kpi_impact} />
-
-          {/* Strategy / mitigation tiles (KPI-style chips) */}
-          <StrategyCards
-            items={(res?.explainStruct?.strategies as any[]) ||
-                   (res?.explanation||"")
-                     .split("\n").filter(l=>/^\s*[-•]/.test(l))
-                     .map(l=>({ title: l.replace(/^\s*[-•]\s*/, "") }))}
-          />
             <ExplainSections structured={res?.explainStruct as any} markdown={stripKpiSection(res?.explanation || "")} narrative={narrativeMd} />
           </Card>
         </section>
